@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
-use crate::descriptor::View;
+use crate::descriptor::{Heap, View, host::HostHeap};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -77,8 +77,6 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
-    /// A fresh table of the stage being bound could not be made.
-    table_failed: bool,
 }
 
 impl Drop for State {
@@ -87,6 +85,98 @@ impl Drop for State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
+}
+
+#[derive(Default)]
+struct TableReservations<'a> {
+    ranges: Vec<ReservedRange<'a>>,
+}
+
+struct ReservedRange<'a> {
+    host: &'a HostHeap,
+    key: (u64, u64),
+    first: u32,
+    count: u32,
+}
+
+impl<'a> TableReservations<'a> {
+    fn reserve(&mut self, host: &'a HostHeap, key: (u64, u64), count: u32) -> Option<(u32, bool)> {
+        if let Some(range) = self
+            .ranges
+            .iter()
+            .find(|range| std::ptr::eq(host, range.host) && key == range.key)
+        {
+            return Some((range.first, false));
+        }
+        let first = host.dynamic(count)?;
+        self.ranges.push(ReservedRange {
+            host,
+            key,
+            first,
+            count,
+        });
+        Some((first, true))
+    }
+
+    /// The recorded list takes over the ranges after a successful bind.
+    fn commit(mut self) {
+        self.ranges.clear();
+    }
+}
+
+impl Drop for TableReservations<'_> {
+    fn drop(&mut self) {
+        for range in &self.ranges {
+            range.host.release(range.first, range.count);
+        }
+    }
+}
+
+struct PreparedTable<'a> {
+    slot: u8,
+    heap: &'static Heap,
+    host: &'static HostHeap,
+    key: (u64, u64),
+    first: u32,
+    count: u32,
+    entries: Vec<&'a UsedResource>,
+    new: bool,
+}
+
+struct PreparedTables<'a> {
+    fresh_slots: Vec<u8>,
+    fresh: Vec<PreparedTable<'a>>,
+}
+
+#[cfg(test)]
+#[test]
+fn failed_table_reservation_gives_back_only_its_new_slots() {
+    let Some(heap) = HostHeap::new(false, 4) else {
+        return; // no host GPU
+    };
+    // SAFETY: a live heap.
+    let capacity = unsafe { heap.heap.GetDesc() }.NumDescriptors - heap.count();
+    let recorded = heap.dynamic(capacity - 4).unwrap();
+    let mut reservations = TableReservations::default();
+    let (first, new) = reservations.reserve(&heap, (1, 1), 3).unwrap();
+    assert!(new);
+    assert_eq!(reservations.reserve(&heap, (1, 1), 3), Some((first, false)));
+    assert_eq!(reservations.reserve(&heap, (2, 2), 2), None);
+    // Take the last slot so the next-fit cursor wraps before we check the
+    // released range. Finding a range across the cursor is separate (#251).
+    let tail = heap.dynamic(1).unwrap();
+    drop(reservations);
+    heap.release(tail, 1);
+
+    assert_eq!(heap.dynamic(4), Some(first));
+    assert_eq!(heap.dynamic(1), None);
+    heap.release(first, 4);
+    let mut reservations = TableReservations::default();
+    assert_eq!(reservations.reserve(&heap, (3, 3), 4), Some((first, true)));
+    reservations.commit();
+    assert_eq!(heap.dynamic(1), None);
+    heap.release(recorded, capacity - 4);
+    assert_eq!(heap.dynamic(1), Some(recorded));
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -416,6 +506,38 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // A draw can need several fresh tables, across several stages. Reserve
+        // them all before touching any descriptors or queuing upload work.
+        let mut reservations = TableReservations::default();
+        let Some(tables) = p
+            .stages
+            .iter()
+            .map(|stage| self.reserve_tables(&mut reservations, &stage.translated().used, compute))
+            .collect::<Option<Vec<_>>>()
+        else {
+            static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+            let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    dropped = n,
+                    "a draw or dispatch dropped: no dynamic slots for its tables"
+                );
+            }
+            return false;
+        };
+        for table in tables
+            .iter()
+            .flat_map(|stage| &stage.fresh)
+            .filter(|table| table.new)
+        {
+            self.fresh_tables.insert(table.key, table.first);
+            self.dynamic.push((
+                std::ptr::from_ref(table.heap) as usize,
+                table.first,
+                table.count,
+            ));
+        }
+        reservations.commit();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -456,29 +578,18 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
-        for stage in &p.stages {
+        for (stage, tables) in p.stages.iter().zip(tables) {
             let t = stage.translated();
-            self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
-            if self.table_failed {
-                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
-                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::warn!(
-                        dropped = n,
-                        "a draw or dispatch dropped: no dynamic slots for its tables"
-                    );
-                }
-                return false;
-            }
+            self.write_tables(list, &tables, &t.used, compute);
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
-                    let fresh = made
+                    let fresh = tables
+                        .fresh
                         .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                        .find(|table| table.slot == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
+                        Some(table) => table.first * 32,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -638,14 +749,18 @@ impl State {
     /// constant buffer are made afresh for the draw in dynamic slots, with
     /// the constant data copied to upload memory when the list is
     /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// console only 16. Reserves the new offsets before recording the bind.
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn reserve_tables<'a>(
+        &self,
+        reservations: &mut TableReservations<'_>,
+        used: &'a [UsedResource],
+        compute: bool,
+    ) -> Option<PreparedTables<'a>> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -676,13 +791,8 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
-            }
-        }
-        let mut made = Vec::new();
-        for slot in fresh {
+        let mut prepared = Vec::new();
+        for &slot in &fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -713,31 +823,65 @@ impl State {
                 }
                 (table, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            // If any reservation fails, the bind drops its new ranges. The
+            // draw must not fall back to title slots for a missing table (#59).
+            let (first, new) = match self.fresh_tables.get(&key) {
+                Some(&first) => (first, false),
+                None => reservations.reserve(host, key, n)?,
+            };
+            prepared.push(PreparedTable {
+                slot,
+                heap,
+                host,
+                key,
+                first,
+                count: n,
+                entries,
+                new,
+            });
+        }
+        Some(PreparedTables {
+            fresh_slots: fresh,
+            fresh: prepared,
+        })
+    }
+
+    fn write_tables(
+        &self,
+        list: &HostList,
+        tables: &PreparedTables<'_>,
+        used: &[UsedResource],
+        compute: bool,
+    ) {
+        for u in used {
+            if u.root == RootType::Table && !tables.fresh_slots.contains(&u.slot) {
+                self.table_entry(list, u, compute);
+            }
+        }
+        for PreparedTable {
+            slot,
+            host,
+            key,
+            first,
+            count,
+            entries,
+            new,
+            ..
+        } in &tables.fresh
+        {
+            let (table, _) = *key;
+            if !*new {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u, &view);
                     }
                 }
-                made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
-                // Without its fresh table the shader would read the title's
-                // slots, which for constant buffer tables hold no constant
-                // view: a texture or null descriptor read as a buffer gives
-                // a wild address on AMD and the device is removed (#59).
-                // The draw or dispatch is dropped instead.
-                self.table_failed = true;
-                continue;
-            };
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
-            for k in 0..n {
+            for k in 0..*count {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
@@ -763,9 +907,7 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
         }
-        made
     }
 
     /// The first draws, at debug level: what they bind and read
