@@ -7,7 +7,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, RECT, S_OK, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -15,7 +17,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{HRESULT, Interface, PCWSTR, w};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -250,6 +252,25 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_meter_requires_native_present_success() {
+        use super::{DXGI_ERROR_DEVICE_REMOVED, DXGI_STATUS_OCCLUDED, S_OK, report_present};
+        use windows::Win32::Foundation::DXGI_STATUS_MODE_CHANGED;
+
+        let mut previous = None;
+        assert!(report_present(&mut previous, S_OK));
+        for status in [
+            DXGI_STATUS_OCCLUDED,
+            DXGI_STATUS_MODE_CHANGED,
+            DXGI_ERROR_DEVICE_REMOVED,
+        ] {
+            assert!(!report_present(&mut previous, status));
+            assert!(!report_present(&mut previous, status));
+            assert_eq!(previous, Some(status));
+        }
+        assert!(report_present(&mut previous, S_OK));
+    }
+
     use super::*;
 
     #[test]
@@ -1461,6 +1482,37 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    last_present: Option<HRESULT>,
+}
+
+/// Report changes in the native result without logging every frame.
+/// DXGI can return a nonnegative status without presenting a frame.
+fn report_present(previous: &mut Option<HRESULT>, result: HRESULT) -> bool {
+    if previous.replace(result) != Some(result) {
+        let status = match result {
+            S_OK => "S_OK",
+            DXGI_STATUS_OCCLUDED => "DXGI_STATUS_OCCLUDED",
+            DXGI_ERROR_DEVICE_REMOVED => "DXGI_ERROR_DEVICE_REMOVED",
+            DXGI_ERROR_DEVICE_RESET => "DXGI_ERROR_DEVICE_RESET",
+            _ => "other",
+        };
+        if result.is_err() {
+            tracing::warn!(
+                target: "victory_gpu::host::present",
+                hresult = format_args!("{:#010x}", result.0 as u32),
+                status,
+                "IDXGISwapChain::Present"
+            );
+        } else {
+            tracing::info!(
+                target: "victory_gpu::host::present",
+                hresult = format_args!("{:#010x}", result.0 as u32),
+                status,
+                "IDXGISwapChain::Present"
+            );
+        }
+    }
+    result == S_OK
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -1660,7 +1712,10 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if !report_present(&mut p.last_present, result) {
+                return None;
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -1709,6 +1764,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                last_present: None,
             })
         }
     }

@@ -101,6 +101,11 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+For black-screen diagnostics, `VICTORY_LOG=off,victory_gpu::host::present=info`
+shows the first DXGI `Present` result and subsequent status changes, including
+the native HRESULT. The window's frame rate counts only `S_OK` results.
+`S_OK` confirms that DXGI accepted the frame. Its contents can still be black.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
