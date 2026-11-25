@@ -59,8 +59,12 @@ translation_inputs! {
     "emit/bitcode/census.rs",
     "emit/bitcode/opt.rs",
     "emit/container.rs",
+    "emit/descriptor_data.rs",
+    "emit/float64.rs",
     "emit/guest_address.rs",
+    "emit/idiom.rs",
     "emit/intersect.rs",
+    "emit/link.rs",
     "emit/lower.rs",
     "emit/mod.rs",
     "emit/own_bits.rs",
@@ -94,6 +98,7 @@ mod source_tests {
     // remaining modules are only compiled by the Windows execution tests.
     const OUTSIDE_TRANSLATION: &[&str] = &[
         "emit/cube_lod_tests.rs",
+        "emit/descriptor_tests.rs",
         "emit/diff_tests.rs",
         "emit/helper_lane_tests.rs",
         "emit/host.rs",
