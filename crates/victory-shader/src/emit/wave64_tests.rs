@@ -1675,3 +1675,84 @@ fn scc_of_a_mask_with_lanes_elsewhere_read_as_a_number_takes_the_paired_form() {
         }
     }
 }
+
+// ---- a section that reads a lane of an earlier section's result ----
+
+/// `native`, translated for 64-lane waves, by what [`super::emit`] gives 32-lane waves and in
+/// the paired form, stores the console's `console` (`dwords` per thread, `dwords` a power of
+/// two) on WARP and the hardware device.
+fn as_on_the_console(native: &NativeProgram, console: &[u32], dwords: usize) {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let wide = lowered_for_width(native, &p, &HashSet::new(), 64).expect("lower for 64 lanes");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut wide.dxil.clone()).expect("DXIL validation failed");
+    }
+    let narrow = chosen_for_32_lanes(native);
+    let pair = paired(native);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (warp, shader, form) in [
+        (true, &wide, "64-lane waves on WARP"),
+        (false, &wide, "64-lane waves on the hardware device"),
+        (false, &narrow, "the form emit chooses for 32-lane waves"),
+        (false, &pair, "the paired form"),
+    ] {
+        match run_once(warp, shader, console.len() as u32) {
+            Some(got) => {
+                if let Some(n) = (0..console.len()).find(|&n| got[n] != console[n]) {
+                    panic!("{form}: thread {}, dword {}: {:#x}, the console's {:#x}", n / dwords, n % dwords, got[n], console[n]);
+                }
+                eprintln!("{form}: as on the console");
+            }
+            None => eprintln!("no device that takes {form}; not run"),
+        }
+    }
+}
+
+/// One console wave of 64 threads; the threads below 40 sum t + 1 over the wave in a
+/// whole-wave section as [`lane_read_past_the_restore_program`] does, and read lane 63 of the
+/// sum as the first step of the next section (0x218 m092 at 0x130-0x134), which ends by
+/// restoring EXEC or, with `lane0`, by setting it to s[18:19] = 1 (m128 at 0x1a4): lane 0
+/// alone then stores. The threads that store put the sum in dword 0 of their two and t + 1 in
+/// dword 1.
+fn next_section_program(lane0: bool) -> (NativeProgram, Vec<u32>) {
+    let mut w = vec![
+        vop2(0x25, 1, k(1), 0), // v_add_nc_u32 v1, 1, v0
+        vopc(0xD4, k(40), 0),   // v_cmpx_gt_u32 exec, 40, v0
+        sop1(0x04, 18, k(1)),   // s_mov_b64 s[18:19], 1
+        sop1(0x25, 12, k(65)),  // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0002,
+        0x0032_0280, // v_cndmask_b32 v2, 0, v1, s[12:13]
+    ];
+    for dpp in [0xDE54_C102u32, 0x9360_1202, 0x0009_2402] {
+        w.extend([vop2(0x25, 2, 0xE9, 2), dpp]); // v_add_nc_u32 v2, v2, v2 dpp8:[...]
+    }
+    w.extend([
+        vop2(0x25, 2, 0xFA, 2),
+        0xFF09_4002, // v_add_nc_u32 v2, v2, v2 row_mirror bound_ctrl:1
+        0xD778_0003,
+        0x0201_0102,            // v_permlanex16_b32 v3, v2, 0, 0
+        vop2(0x25, 2, v(3), 2), // v_add_nc_u32 v2, v3, v2
+        0xD760_000E,
+        0x0001_0102,            // v_readlane_b32 s14, v2, 0
+        vop2(0x25, 2, 14, 2),   // v_add_nc_u32 v2, s14, v2
+        sop1(0x04, EXEC, 12),   // s_mov_b64 exec, s[12:13]
+        sop1(0x25, 12, k(65)),  // s_or_saveexec_b64 s[12:13], -1
+        0xD760_000F,
+        0x0001_7F02, // v_readlane_b32 s15, v2, 63
+        sop1(0x04, EXEC, if lane0 { 18 } else { 12 }), // s_mov_b64 exec, s[18:19] or s[12:13]
+        vop1(0x01, 3, 15),       // v_mov_b32 v3, s15
+        vop2(0x1A, 15, k(3), 0), // v_lshlrev_b32 v15, 3, v0
+    ]);
+    w.extend(store(3, 15, 0));
+    w.extend(store(1, 15, 4));
+    let sum: u32 = (1..=40).sum();
+    let stores = |t: u32| if lane0 { t == 0 } else { t < 40 };
+    let console = (0..64u32).flat_map(|t| if stores(t) { [sum, t + 1] } else { [0, 0] }).collect();
+    (native(&w), console)
+}
+
+#[test]
+fn a_lane_of_a_sum_read_in_the_next_section_is_the_consoles_sum() {
+    let (native, console) = next_section_program(false);
+    as_on_the_console(&native, &console, 2);
+}

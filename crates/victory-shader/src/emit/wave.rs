@@ -263,6 +263,11 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
     let mut out = HashMap::new();
+    // What the block's earlier sections left in each lane: a section that reads a lane of an
+    // earlier one's result (the compiler reads lane 63 of a reduction right after the next
+    // section's `s_or_saveexec`) is followed with it. A lane read ignores EXEC, and the values
+    // are the block's own (SSA), which nothing between the sections changes.
+    let (mut vec, mut uni) = (HashMap::new(), HashMap::new());
     let mut i = 0;
     while i < insts.len() {
         let inst = &insts[i];
@@ -305,7 +310,10 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                         .any(|&(r, x)| matches!(r, Reg::V(_)) && body.iter().any(|b| b.writes.iter().any(|w| w.1 == x)))
             })
             .collect();
-        let mut shapes = simulate(body.iter().chain(tail.iter().copied()), wave, saved);
+        let (mut shapes, v, u) = simulate(body.iter().chain(tail.iter().copied()), wave, saved, vec, uni);
+        (vec, uni) = (v, u);
+        // (the shapes of the values this section writes, not an earlier one's again)
+        shapes.retain(|x, _| body.iter().chain(tail.iter().copied()).any(|t| t.writes.iter().any(|w| w.1 == *x)));
         let tail = tail
             .iter()
             .flat_map(|t| &t.writes)
@@ -399,15 +407,24 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate<'a>(insts: impl IntoIterator<Item = &'a Inst>, wave: u32, saved: Value) -> HashMap<Value, Shape> {
+/// What [`simulate`] finds: the shapes, and each value's lanes (vector, then scalar).
+type Lanes = (HashMap<Value, Shape>, HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
+
+/// The simulation of `insts` from the lanes' values `vec` and `uni` (an earlier section's, or
+/// none), with the shapes it finds and the lanes' values it ends with.
+fn simulate<'a>(
+    insts: impl IntoIterator<Item = &'a Inst>,
+    wave: u32,
+    saved: Value,
+    mut vec: HashMap<Value, Vec<Sym>>,
+    mut uni: HashMap<Value, Sym>,
+) -> Lanes {
     let all = if wave == 64 {
         u64::MAX
     } else {
         u64::from(u32::MAX)
     };
     let mut exec = all;
-    let mut vec: HashMap<Value, Vec<Sym>> = HashMap::new();
-    let mut uni: HashMap<Value, Sym> = HashMap::new();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
     for inst in insts {
@@ -420,7 +437,7 @@ fn simulate<'a>(insts: impl IntoIterator<Item = &'a Inst>, wave: u32, saved: Val
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave);
+                return (shapes(&vec, &uni, wave), vec, uni);
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -435,7 +452,7 @@ fn simulate<'a>(insts: impl IntoIterator<Item = &'a Inst>, wave: u32, saved: Val
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave);
+                return (shapes(&vec, &uni, wave), vec, uni);
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -733,7 +750,7 @@ fn simulate<'a>(insts: impl IntoIterator<Item = &'a Inst>, wave: u32, saved: Val
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    (shapes(&vec, &uni, wave), vec, uni)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -759,8 +776,8 @@ fn constant(inst: &Inst) -> Option<u64> {
 
 /// The shape of each value, where every lane agrees on one.
 fn shapes(
-    vec: HashMap<Value, Vec<Sym>>,
-    uni: HashMap<Value, Sym>,
+    vec: &HashMap<Value, Vec<Sym>>,
+    uni: &HashMap<Value, Sym>,
     wave: u32,
 ) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
@@ -788,13 +805,13 @@ fn shapes(
         } if lanes == all => Some(Shape::Sum64 { high, lo, hi, mask }),
         _ => None,
     };
-    for (v, s) in uni {
+    for (&v, &s) in uni {
         if let Some(sh) = single(s) {
             out.insert(v, sh);
         }
     }
-    for (v, lanes) in vec {
-        if let Some(sh) = per_lane(&lanes, all) {
+    for (&v, lanes) in vec {
+        if let Some(sh) = per_lane(lanes, all) {
             out.insert(v, sh);
         }
     }
