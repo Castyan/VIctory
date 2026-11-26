@@ -693,20 +693,27 @@ pub(crate) extern "system" fn create_native_compute(
         // SAFETY: the title's out pointer.
         unsafe { *out = std::ptr::null() };
     }
-    let program = (|| {
-        let registers = title_bytes(desc, 1)?;
-        let code = title_bytes(desc, 5)?;
-        let table = title_bytes(desc, 7)?;
-        victory_shader::native::console_compute_container(&registers, &table, &code)
-            .map_err(|e| tracing::debug!(error = %e, "a compute program compiled by the title is not read"))
-            .ok()
+    let program = (|| -> Result<Vec<u8>, String> {
+        let registers = title_bytes(desc, 1).map_err(|e| format!("registers: {e}"))?;
+        let code = title_bytes(desc, 5).map_err(|e| format!("code: {e}"))?;
+        let table = title_bytes(desc, 7).map_err(|e| format!("resource table: {e}"))?;
+        victory_shader::native::console_compute_container(&registers, &table, &code).map_err(|e| e.to_string())
     })();
-    let made = MADE[usize::from(program.is_none())].fetch_add(1, Ordering::Relaxed) + 1;
-    let Some(container) = program else {
-        if made.is_power_of_two() {
-            tracing::warn!(missed = made, "a compute pipeline from compiled code that is not read: the title goes without it");
+    let made = MADE[usize::from(program.is_err())].fetch_add(1, Ordering::Relaxed) + 1;
+    let container = match program {
+        Ok(container) => container,
+        Err(why) => {
+            dump_native(desc, &why);
+            if made <= 4 || made.is_power_of_two() {
+                tracing::warn!(
+                    missed = made,
+                    why,
+                    description = format_args!("{:x?}", title_words(desc)),
+                    "a compute pipeline from compiled code that is not read: the title goes without it"
+                );
+            }
+            return crate::object::E_NOTIMPL;
         }
-        return crate::object::E_NOTIMPL;
     };
     let shader = shader("compute", &container);
     if made.is_power_of_two() {
@@ -723,29 +730,95 @@ pub(crate) extern "system" fn create_native_compute(
 
 /// The bytes named by words `at` (address) and `at + 1` (size) of the
 /// title's description `desc`, read through the kernel: the title's own
-/// memory, which may not be mapped.
-fn title_bytes(desc: *const u8, at: usize) -> Option<Vec<u8>> {
+/// memory, which may not be mapped. Why not, if not.
+fn title_bytes(desc: *const u8, at: usize) -> Result<Vec<u8>, String> {
     #[cfg(windows)]
     {
         let mut words = [0u8; 16];
         if desc.is_null() {
-            return None;
+            return Err("no description".to_owned());
         }
         let start = desc.wrapping_add(8 * at);
         if !crate::host::read_into(start, &mut words) {
-            return None;
+            return Err("the description is not readable".to_owned());
         }
-        let address = u64::from_le_bytes(words[..8].try_into().ok()?) as usize;
-        let size = u64::from_le_bytes(words[8..].try_into().ok()?) as usize;
+        let address = u64::from_le_bytes(words[..8].try_into().unwrap()) as usize;
+        let size = u64::from_le_bytes(words[8..].try_into().unwrap()) as usize;
         if address == 0 || !(4..=1 << 20).contains(&size) {
-            return None;
+            return Err(format!("implausible block {address:#x}+{size:#x}"));
         }
         let mut bytes = vec![0u8; size];
-        crate::host::read_into(address as *const u8, &mut bytes).then_some(bytes)
+        if crate::host::read_into(address as *const u8, &mut bytes) {
+            Ok(bytes)
+        } else {
+            Err(format!("block {address:#x}+{size:#x} not readable"))
+        }
     }
     #[cfg(not(windows))]
     {
         let _ = (desc, at);
+        Err("not on this host".to_owned())
+    }
+}
+
+/// `VICTORY_DUMP_NATIVE=<folder>`: a description device method 0x218 could
+/// not read is saved there, with the blocks it names, as
+/// `slot218-<n>-desc-<address>.bin` and `slot218-<n>-dNN-<address>-<size>.bin`
+/// (what `pr64-replay` reads); four of each reason, 200 in all.
+fn dump_native(desc: *const u8, why: &str) {
+    #[cfg(windows)]
+    {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static FOLDER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+        static SEEN: Mutex<Option<(u32, HashMap<String, u32>)>> = Mutex::new(None);
+        let Some(folder) = FOLDER.get_or_init(|| std::env::var_os("VICTORY_DUMP_NATIVE").map(std::path::PathBuf::from)) else {
+            return;
+        };
+        let Some(words) = title_words(desc) else { return };
+        let n = {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let (total, reasons) = seen.get_or_insert_with(Default::default);
+            let reason = reasons.entry(why.to_owned()).or_default();
+            if *total >= 200 || *reason >= 4 {
+                return;
+            }
+            *reason += 1;
+            *total += 1;
+            *total
+        };
+        let _ = std::fs::create_dir_all(folder);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let _ = std::fs::write(folder.join(format!("slot218-m{n:03}-desc-{:x}.bin", desc as usize)), bytes);
+        for at in [1, 3, 5, 7] {
+            let (address, size) = (words[at] as usize, words[at + 1] as usize);
+            if address == 0 || size == 0 || size > 1 << 20 {
+                continue;
+            }
+            let mut block = vec![0u8; size];
+            if crate::host::read_into(address as *const u8, &mut block) {
+                let _ = std::fs::write(folder.join(format!("slot218-m{n:03}-d{at:02}-{address:x}-{size:x}.bin")), block);
+            }
+        }
+        let _ = std::fs::write(folder.join(format!("slot218-m{n:03}-why.txt")), why);
+    }
+    #[cfg(not(windows))]
+    let _ = (desc, why);
+}
+
+/// The twelve words of a description (0x60 bytes), for the log.
+fn title_words(desc: *const u8) -> Option<[u64; 12]> {
+    #[cfg(windows)]
+    {
+        let mut bytes = [0u8; 0x60];
+        if desc.is_null() || !crate::host::read_into(desc, &mut bytes) {
+            return None;
+        }
+        Some(std::array::from_fn(|k| u64::from_le_bytes(bytes[8 * k..8 * k + 8].try_into().unwrap())))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = desc;
         None
     }
 }
