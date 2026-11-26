@@ -1301,53 +1301,66 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
 
 // ---- lane masks the code sets to constant lanes ----
 
-/// One console wave of 64 threads; thread t stores t + 1 to dword 0..3 of its eight (32 bytes
-/// at 32 t) under EXEC set to constant lanes the four ways the title's programs do it
-/// (`s_bfm_b64 exec, 32, 0` before a reduction over LDS, its halves moved apart as
-/// `s_mov_b32 exec_lo, 17` / `exec_hi`, `s_bitreplicate_b64_b32 exec, lit`, and the low half
-/// alone after `s_mov_b64 exec, -1`), and stores EXEC as copied in the first two ways as
-/// numbers to dwords 4..7. The halves differ, so that lanes 32-63 taking the low half's bits
-/// shows.
+/// One console wave of 64 threads; thread t stores t + 1 to dwords 0..7 of its sixteen (64
+/// bytes at 64 t), each under EXEC set to constant lanes one of the ways the title's programs
+/// do it: `s_bfm_b64 exec, 32, 0` before a reduction over LDS; the halves moved apart
+/// (`s_mov_b32 exec_lo, 17`, `exec_hi`); `s_bitreplicate_b64_b32 exec, lit`; the low half alone
+/// after `s_mov_b64 exec, -1` (`s_mov_b32`, `s_pack_ll_b32_b16 exec_lo, 1, 1`); and the other
+/// 32-bit constants (`s_movk_i32`, `s_brev_b32`, `s_pack_lh/hh_b32_b16`). It stores EXEC as
+/// copied in the first two ways as numbers to dwords 8..11. The halves differ, so that lanes
+/// 32-63 taking the low half's bits shows.
 fn constant_exec_program() -> (NativeProgram, Vec<u32>) {
+    const ALL: u64 = u64::MAX;
     let replicate = 0x0F0F_3C3Cu32;
     let replicated = (0..32).filter(|n| replicate >> n & 1 == 1).fold(0u64, |r, n| r | 3 << (2 * n));
-    let masks = [0xFFFF_FFFF, 0x0011_0000_0000_0011, replicated, 0xFFFF_FFFF_0055_0055];
-    let mut w = vec![
-        vop2(0x1A, 15, k(5), 0), // v_lshlrev_b32 v15, 5, v0: the thread's 32 bytes
-        vop2(0x25, 1, k(1), 0),  // v_add_nc_u32 v1, 1, v0
-        sop2(0x25, EXEC, k(32), k(0)), // s_bfm_b64 exec, 32, 0
+    // (the code setting EXEC after `s_mov_b64 exec, -1`, the console's EXEC)
+    let cases: [(Vec<u32>, u64); 8] = [
+        (vec![sop2(0x25, EXEC, k(32), k(0))], 0xFFFF_FFFF), // s_bfm_b64 exec, 32, 0
+        (
+            vec![
+                sop1(0x03, EXEC, k(17)),   // s_mov_b32 exec_lo, 17
+                sop1(0x03, EXEC + 1, LIT), // s_mov_b32 exec_hi, 0x110000
+                0x0011_0000,
+            ],
+            0x0011_0000_0000_0011,
+        ),
+        (vec![sop1(0x3B, EXEC, LIT), replicate], replicated), // s_bitreplicate_b64_b32 exec, lit
+        (vec![sop1(0x03, EXEC, LIT), 0x0055_0055], ALL << 32 | 0x0055_0055), // s_mov_b32 exec_lo, lit
+        (vec![sop2(0x32, EXEC, k(1), LIT), 0x8003], ALL << 32 | 0x8003_0001), // s_pack_ll_b32_b16 exec_lo, 1, lit
+        (
+            vec![
+                0xB000_0000 | EXEC << 16 | 0x80FF, // s_movk_i32 exec_lo, 0x80ff: sign-extended
+                sop1(0x0B, EXEC + 1, k(15)),       // s_brev_b32 exec_hi, 15
+            ],
+            0xF000_0000_FFFF_80FF,
+        ),
+        // s_pack_hh_b32_b16 exec_hi, lit, -1
+        (vec![sop2(0x34, EXEC + 1, LIT, k(65)), 0x0009_0000], 0xFFFF_0009_FFFF_FFFF),
+        // s_pack_lh_b32_b16 exec_lo, lit, -16
+        (vec![sop2(0x33, EXEC, LIT, k(80)), 0x0000_0C03], ALL << 32 | 0xFFFF_0C03),
     ];
-    w.extend(store(1, 15, 0));
-    w.extend([
-        sop1(0x04, 20, EXEC),    // s_mov_b64 s[20:21], exec
-        sop1(0x04, EXEC, k(65)), // s_mov_b64 exec, -1 (k(65): the inline -1)
-        sop1(0x03, EXEC, k(17)), // s_mov_b32 exec_lo, 17
-        sop1(0x03, EXEC + 1, LIT), // s_mov_b32 exec_hi, 0x110000
-        0x0011_0000,
-    ]);
-    w.extend(store(1, 15, 4));
-    w.extend([
-        sop1(0x04, 22, EXEC),    // s_mov_b64 s[22:23], exec
-        sop1(0x04, EXEC, k(65)), // s_mov_b64 exec, -1
-        sop1(0x3B, EXEC, LIT),   // s_bitreplicate_b64_b32 exec, 0x0f0f3c3c
-        replicate,
-    ]);
-    w.extend(store(1, 15, 8));
-    w.extend([
-        sop1(0x04, EXEC, k(65)), // s_mov_b64 exec, -1
-        sop1(0x03, EXEC, LIT),   // s_mov_b32 exec_lo, 0x550055 (exec_hi stays all lanes)
-        0x0055_0055,
-    ]);
-    w.extend(store(1, 15, 12));
+    let mut w = vec![
+        vop2(0x1A, 15, k(6), 0), // v_lshlrev_b32 v15, 6, v0: the thread's 64 bytes
+        vop2(0x25, 1, k(1), 0),  // v_add_nc_u32 v1, 1, v0
+    ];
+    for (n, (code, _)) in cases.iter().enumerate() {
+        w.push(sop1(0x04, EXEC, k(65))); // s_mov_b64 exec, -1 (k(65): the inline -1)
+        w.extend(code);
+        w.extend(store(1, 15, 4 * n as u32));
+        if n < 2 {
+            w.push(sop1(0x04, 20 + 2 * n as u32, EXEC)); // s_mov_b64 s[20 + 2n:21 + 2n], exec
+        }
+    }
     w.push(sop1(0x04, EXEC, k(65))); // s_mov_b64 exec, -1
     for (n, s) in [20u32, 21, 22, 23].into_iter().enumerate() {
         w.push(vop1(0x01, 2, s)); // v_mov_b32 v2, s<s>
-        w.extend(store(2, 15, 16 + 4 * n as u32));
+        w.extend(store(2, 15, 32 + 4 * n as u32));
     }
     let console: Vec<u32> = (0..64u32)
         .flat_map(|t| {
-            let at = |m: u64| if m >> t & 1 == 1 { t + 1 } else { 0 };
-            [at(masks[0]), at(masks[1]), at(masks[2]), at(masks[3]), 0xFFFF_FFFF, 0, 0x11, 0x0011_0000]
+            let mut d: Vec<u32> = cases.iter().map(|&(_, m)| if m >> t & 1 == 1 { t + 1 } else { 0 }).collect();
+            d.extend([0xFFFF_FFFF, 0, 0x11, 0x0011_0000, 0, 0, 0, 0]);
+            d
         })
         .collect();
     (native(&w), console)
@@ -1398,7 +1411,7 @@ fn exec_set_to_constant_lanes_guards_both_halves_as_on_the_console() {
         let mut out = host
             .dispatch(&root, &pso, &Dispatch {
                 roots: vec![(0, Root::Constants(ud))],
-                views: &[View::RawUav(64 * 8)],
+                views: &[View::RawUav(64 * 16)],
                 samplers: &[],
                 groups: [1, 1, 1],
             })
@@ -1413,7 +1426,7 @@ fn exec_set_to_constant_lanes_guards_both_halves_as_on_the_console() {
         (false, &pair, "the paired form"),
     ] {
         match run(warp, shader) {
-            Some(got) => same_in_eight(&got, &console, form),
+            Some(got) => same_in_sixteen(&got, &console, form),
             None => eprintln!("no device that takes {form}; not run"),
         }
     }
@@ -1421,10 +1434,10 @@ fn exec_set_to_constant_lanes_guards_both_halves_as_on_the_console() {
 
 /// Panics at the first dword of `got` that is not the console's, naming the thread and which
 /// of its eight dwords.
-fn same_in_eight(got: &[u32], want: &[u32], run: &str) {
+fn same_in_sixteen(got: &[u32], want: &[u32], run: &str) {
     assert_eq!(got.len(), want.len());
     if let Some(n) = (0..want.len()).find(|&n| got[n] != want[n]) {
-        panic!("{run}: thread {}, dword {}: {:#x}, the console's {:#x}", n / 8, n % 8, got[n], want[n]);
+        panic!("{run}: thread {}, dword {}: {:#x}, the console's {:#x}", n / 16, n % 16, got[n], want[n]);
     }
     eprintln!("{run}: as on the console");
 }
