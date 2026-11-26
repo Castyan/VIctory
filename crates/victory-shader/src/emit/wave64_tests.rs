@@ -1573,3 +1573,105 @@ fn same_in_sixteen(got: &[u32], want: &[u32], run: &str) {
     }
     eprintln!("{run}: as on the console");
 }
+
+// ---- SCC of a mask operation read as a number ----
+
+/// One console wave of 64 threads. `s_and_b64 s[12:13], vcc, exec` of five compares sets SCC
+/// when some lane of the 64 has its bit, which the code reads as a number, as 0x218 m020 does
+/// at 0xf8-0x100 (`s_add_u32 s16, src_scc, s16`): by `s_cselect_b32`, `src_scc` and the carry
+/// of `s_addc_u32`. The masks are lanes 40-63 (the upper half alone), none, lanes 0-7 (the
+/// lower half alone), lanes 48-63 and lanes 56-63; their answers make bits 0-4 of s20, which
+/// every thread stores to its dword.
+fn scc_read_as_a_number_program() -> (NativeProgram, Vec<u32>) {
+    let some = |cmp: u32, c: u32| [vopc(cmp, k(c), 0), sop2(0x0F, 12, VCC, EXEC)]; // s_and_b64 s[12:13], vcc, exec
+    let mut w = vec![sop1(0x03, 20, k(0))]; // s_mov_b32 s20, 0
+    w.extend(some(0xC1, 39)); // v_cmp_lt_u32 vcc, 39, v0
+    w.extend([sop2(0x0A, 14, k(1), k(0)), sop2(0x10, 20, 20, 14)]); // s_cselect_b32 s14, 1, 0; s_or_b32 s20, s20, s14
+    w.extend(some(0xC1, 63));
+    w.extend([sop2(0x0A, 14, k(2), k(0)), sop2(0x10, 20, 20, 14)]);
+    w.extend(some(0xC4, 8)); // v_cmp_gt_u32 vcc, 8, v0
+    w.extend([sop2(0x0A, 14, k(4), k(0)), sop2(0x10, 20, 20, 14)]);
+    w.extend(some(0xC1, 47));
+    w.extend([sop2(0x1E, 14, 253, k(3)), sop2(0x10, 20, 20, 14)]); // s_lshl_b32 s14, src_scc, 3
+    w.extend(some(0xC1, 55));
+    w.extend([sop2(0x04, 14, k(0), k(0)), sop2(0x1E, 14, 14, k(4)), sop2(0x10, 20, 20, 14)]); // s_addc_u32 s14, 0, 0; << 4
+    w.extend([vop1(0x01, 1, 20), vop2(0x1A, 15, k(2), 0)]); // v_mov_b32 v1, s20; v_lshlrev_b32 v15, 2, v0
+    w.extend(store(1, 15, 0));
+    // the console: bit n when the 64-bit mask of case n is not zero
+    let masks: [fn(u32) -> bool; 5] = [|t| t > 39, |t| t > 63, |t| t < 8, |t| t > 47, |t| t > 55];
+    let scc = |f: fn(u32) -> bool| (0..64).filter(|&t| f(t)).fold(0u64, |m, t| m | 1 << t) != 0;
+    let bits = masks.iter().enumerate().map(|(n, &f)| u32::from(scc(f)) << n).sum();
+    (native(&w), vec![bits; 64])
+}
+
+#[test]
+fn scc_of_a_mask_operation_read_as_a_number_is_whether_some_console_lane_has_its_bit() {
+    let (native, console) = scc_read_as_a_number_program();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let wide = lowered_for_width(&native, &p, &HashSet::new(), 64).expect("lower for 64 lanes");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut wide.dxil.clone()).expect("DXIL validation failed");
+    }
+    let narrow = chosen_for_32_lanes(&native);
+    let pair = paired(&native);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (warp, shader, form) in [
+        (true, &wide, "64-lane waves on WARP"),
+        (false, &wide, "64-lane waves on the hardware device"),
+        (false, &narrow, "the form emit chooses for 32-lane waves"),
+        (false, &pair, "the paired form"),
+    ] {
+        match run_once(warp, shader, 64) {
+            Some(got) => {
+                if let Some(t) = (0..64).find(|&t| got[t] != console[t]) {
+                    panic!("{form}: thread {t}: {:#b}, the console's {:#b}", got[t], console[t]);
+                }
+                eprintln!("{form}: as on the console");
+            }
+            None => eprintln!("no device that takes {form}; not run"),
+        }
+    }
+}
+
+/// Inside `if (t < 16)`, `s_not_b64 s[12:13], vcc` of `t < 16` taken over the wave holds lanes
+/// 16-63, none of which runs there: its SCC is set on the console, while the running lanes have
+/// no bit. Where host waves see only the running lanes that SCC is refused; the paired form,
+/// whose host wave runs every console lane, gives the console's. Threads 0-15 store 1.
+fn scc_of_lanes_elsewhere_program() -> (NativeProgram, Vec<u32>) {
+    let mut w = vec![
+        vop2(0x1A, 15, k(2), 0),  // v_lshlrev_b32 v15, 2, v0
+        vopc(0xC4, k(16), 0),     // v_cmp_gt_u32 vcc, 16, v0
+        sop1(0x24, 16, VCC),      // s_and_saveexec_b64 s[16:17], vcc
+        sopp(0x08, 5),            // s_cbranch_execz past the store
+        sop1(0x08, 12, VCC),      // s_not_b64 s[12:13], vcc
+        sop2(0x0A, 14, k(1), k(0)), // s_cselect_b32 s14, 1, 0
+        vop1(0x01, 1, 14),        // v_mov_b32 v1, s14
+    ];
+    w.extend(store(1, 15, 0));
+    w.push(sop1(0x04, EXEC, 16)); // s_mov_b64 exec, s[16:17]
+    // the console: SCC of !(lanes 0-15) over 64 lanes, stored by threads 0-15
+    let scc = !(0..16).fold(0u64, |m, t| m | 1 << t) != 0;
+    (native(&w), (0..64).map(|t| u32::from(t < 16 && scc)).collect())
+}
+
+#[test]
+fn scc_of_a_mask_with_lanes_elsewhere_read_as_a_number_takes_the_paired_form() {
+    let (native, console) = scc_of_lanes_elsewhere_program();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let err = lowered_for_width(&native, &p, &HashSet::new(), 64).map(|_| ()).expect_err("refused");
+    assert!(err.to_string().contains(lower::LANE_MASK), "{err}");
+    let narrow = chosen_for_32_lanes(&native);
+    let pair = paired(&native);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (shader, form) in [(&narrow, "the form emit chooses for 32-lane waves"), (&pair, "the paired form")] {
+        match run_once(false, shader, 64) {
+            Some(got) => {
+                if let Some(t) = (0..64).find(|&t| got[t] != console[t]) {
+                    panic!("{form}: thread {t}: {}, the console's {}", got[t], console[t]);
+                }
+                eprintln!("{form}: as on the console");
+            }
+            None => eprintln!("no device that takes {form}; not run"),
+        }
+    }
+}

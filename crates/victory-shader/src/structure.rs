@@ -443,6 +443,10 @@ pub struct Structured {
     /// SCC values a mask operation sets when some lane's bit of its result is set, with that
     /// lane bit: as data such an SCC is "some lane of the wave has it".
     pub scc_some: HashMap<Value, Bool>,
+    /// SCC values of [`Self::scc_some`] whose lane bit holds only in lanes whose EXEC bit is
+    /// set where they are written: the lanes elsewhere add nothing to the console's "some
+    /// lane", so the running lanes alone answer it.
+    pub scc_active: HashSet<Value>,
 }
 
 impl Structured {
@@ -535,6 +539,8 @@ struct Lanes<'a> {
     /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
     /// two masks: "no lane differs"); the others are set when some lane's is.
     scc_every: HashSet<Value>,
+    /// See [`Structured::scc_active`].
+    scc_active: HashSet<Value>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
 }
@@ -616,6 +622,7 @@ impl<'a> Lanes<'a> {
             active: HashSet::new(),
             wide: HashSet::new(),
             scc_every: HashSet::new(),
+            scc_active: HashSet::new(),
             wave_any: vec![None; blocks.len()],
         })
     }
@@ -627,6 +634,7 @@ impl<'a> Lanes<'a> {
         self.seen.clear();
         self.scc_lane.clear();
         self.scc_every.clear();
+        self.scc_active.clear();
         self.wave_any.fill(None);
         self.joins.clear();
         self.phi_joins.clear();
@@ -856,6 +864,7 @@ impl<'a> Lanes<'a> {
                 .filter(|(scc, _)| !self.scc_every.contains(scc))
                 .map(|(&scc, &m)| (scc, m))
                 .collect(),
+            scc_active: self.scc_active,
             phi_masks,
             bools: self.b,
             exits,
@@ -1354,6 +1363,12 @@ impl<'a> Lanes<'a> {
                     {
                         self.scc_lane.insert(scc, own);
                     }
+                }
+                if let Some(scc) = inst.write(Reg::Scc)
+                    && let (Some(&m), Some(e)) = (self.scc_lane.get(&scc), exec)
+                    && self.b.implies(m, e)
+                {
+                    self.scc_active.insert(scc);
                 }
             }
             Fields::Valu(v) => {

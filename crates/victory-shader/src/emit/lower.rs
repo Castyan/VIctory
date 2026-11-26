@@ -993,6 +993,10 @@ thread_local! {
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    // SCC of a mask operation read as a number ("some lane of the wave"), not branched on
+    if !matches!(i.fields, Fields::Sopp { .. }) && i.read(Reg::Scc).is_some_and(|s| st.scc_some.contains_key(&s)) {
+        return true;
+    }
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
@@ -2665,6 +2669,16 @@ impl<'a> Lower<'a> {
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
+            }
+            // SCC of a mask operation read as a number (`src_scc`, `s_cselect`, `s_addc`): "some
+            // lane of the console wave has its bit", exact where every lane with a bit answers
+            // (the paired form, or a result held in the lanes running there).
+            Some(&Val::Missing(_))
+                if self.mask_data == MaskData::Console
+                    && self.x.st.scc_some.contains_key(&v)
+                    && (self.twin.is_some() || self.x.st.scc_active.contains(&v)) =>
+            {
+                return self.scc_some(v).map(Val::Bit);
             }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
