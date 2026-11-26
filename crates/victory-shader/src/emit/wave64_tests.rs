@@ -1298,3 +1298,133 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+// ---- lane masks the code sets to constant lanes ----
+
+/// One console wave of 64 threads; thread t stores t + 1 to dword 0..3 of its eight (32 bytes
+/// at 32 t) under EXEC set to constant lanes the four ways the title's programs do it
+/// (`s_bfm_b64 exec, 32, 0` before a reduction over LDS, its halves moved apart as
+/// `s_mov_b32 exec_lo, 17` / `exec_hi`, `s_bitreplicate_b64_b32 exec, lit`, and the low half
+/// alone after `s_mov_b64 exec, -1`), and stores EXEC as copied in the first two ways as
+/// numbers to dwords 4..7. The halves differ, so that lanes 32-63 taking the low half's bits
+/// shows.
+fn constant_exec_program() -> (NativeProgram, Vec<u32>) {
+    let replicate = 0x0F0F_3C3Cu32;
+    let replicated = (0..32).filter(|n| replicate >> n & 1 == 1).fold(0u64, |r, n| r | 3 << (2 * n));
+    let masks = [0xFFFF_FFFF, 0x0011_0000_0000_0011, replicated, 0xFFFF_FFFF_0055_0055];
+    let mut w = vec![
+        vop2(0x1A, 15, k(5), 0), // v_lshlrev_b32 v15, 5, v0: the thread's 32 bytes
+        vop2(0x25, 1, k(1), 0),  // v_add_nc_u32 v1, 1, v0
+        sop2(0x25, EXEC, k(32), k(0)), // s_bfm_b64 exec, 32, 0
+    ];
+    w.extend(store(1, 15, 0));
+    w.extend([
+        sop1(0x04, 20, EXEC),    // s_mov_b64 s[20:21], exec
+        sop1(0x04, EXEC, k(65)), // s_mov_b64 exec, -1 (k(65): the inline -1)
+        sop1(0x03, EXEC, k(17)), // s_mov_b32 exec_lo, 17
+        sop1(0x03, EXEC + 1, LIT), // s_mov_b32 exec_hi, 0x110000
+        0x0011_0000,
+    ]);
+    w.extend(store(1, 15, 4));
+    w.extend([
+        sop1(0x04, 22, EXEC),    // s_mov_b64 s[22:23], exec
+        sop1(0x04, EXEC, k(65)), // s_mov_b64 exec, -1
+        sop1(0x3B, EXEC, LIT),   // s_bitreplicate_b64_b32 exec, 0x0f0f3c3c
+        replicate,
+    ]);
+    w.extend(store(1, 15, 8));
+    w.extend([
+        sop1(0x04, EXEC, k(65)), // s_mov_b64 exec, -1
+        sop1(0x03, EXEC, LIT),   // s_mov_b32 exec_lo, 0x550055 (exec_hi stays all lanes)
+        0x0055_0055,
+    ]);
+    w.extend(store(1, 15, 12));
+    w.push(sop1(0x04, EXEC, k(65))); // s_mov_b64 exec, -1
+    for (n, s) in [20u32, 21, 22, 23].into_iter().enumerate() {
+        w.push(vop1(0x01, 2, s)); // v_mov_b32 v2, s<s>
+        w.extend(store(2, 15, 16 + 4 * n as u32));
+    }
+    let console: Vec<u32> = (0..64u32)
+        .flat_map(|t| {
+            let at = |m: u64| if m >> t & 1 == 1 { t + 1 } else { 0 };
+            [at(masks[0]), at(masks[1]), at(masks[2]), at(masks[3]), 0xFFFF_FFFF, 0, 0x11, 0x0011_0000]
+        })
+        .collect();
+    (native(&w), console)
+}
+
+/// `native` as [`super::emit`] gives it to a host of 32-lane waves, validated by `dxil.dll`
+/// when present.
+fn chosen_for_32_lanes(native: &NativeProgram) -> HostShader {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(&c, native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("emit");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    shader
+}
+
+#[test]
+fn exec_set_to_constant_lanes_guards_both_halves_as_on_the_console() {
+    let (native, console) = constant_exec_program();
+    // the structurisation sees the constants, not masks it cannot see into
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let opaque = st.guards.iter().flatten().flatten().any(|&g| {
+        st.bools.support(g).iter().any(|a| matches!(a, structure::Atom::Opaque(_)))
+    });
+    assert!(!opaque, "a constant EXEC taken as an opaque mask");
+    // a host of 64-lane waves: the console's waves
+    let wide = lowered_for_width(&native, &p, &HashSet::new(), 64).expect("lower for 64 lanes");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut wide.dxil.clone()).expect("DXIL validation failed");
+    }
+    let narrow = chosen_for_32_lanes(&native);
+    let pair = paired(&native);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let run = |warp: bool, shader: &HostShader| -> Option<Vec<u32>> {
+        let host = Host::new(warp).map_err(|e| eprintln!("device: {e}")).ok()?;
+        let (root, pso) = host.compute_pipeline(shader).map_err(|e| eprintln!("pipeline: {e}")).ok()?;
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut out = host
+            .dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64 * 8)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            })
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out.swap_remove(0))
+    };
+    // (WARP's waves have 4 lanes: none of these forms runs there)
+    for (warp, shader, form) in [
+        (true, &wide, "64-lane waves on WARP"),
+        (false, &wide, "64-lane waves on the hardware device"),
+        (false, &narrow, "the form emit chooses for 32-lane waves"),
+        (false, &pair, "the paired form"),
+    ] {
+        match run(warp, shader) {
+            Some(got) => same_in_eight(&got, &console, form),
+            None => eprintln!("no device that takes {form}; not run"),
+        }
+    }
+}
+
+/// Panics at the first dword of `got` that is not the console's, naming the thread and which
+/// of its eight dwords.
+fn same_in_eight(got: &[u32], want: &[u32], run: &str) {
+    assert_eq!(got.len(), want.len());
+    if let Some(n) = (0..want.len()).find(|&n| got[n] != want[n]) {
+        panic!("{run}: thread {}, dword {}: {:#x}, the console's {:#x}", n / 8, n % 8, got[n], want[n]);
+    }
+    eprintln!("{run}: as on the console");
+}
