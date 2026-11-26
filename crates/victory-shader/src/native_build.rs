@@ -10,20 +10,32 @@
 //! ```text
 //! +0x00 u32 kind (bit 10: 8 bytes more of header), u32 size of the rest
 //!       (from +0x0c, or +0x14), u32, u32 ..., the last u32 of the header
-//!       holding the count of 0x41 entries in its high half (`n << 16 | 0x440`)
-//! entries of 0x20 bytes from the end of the header:
+//!       `n << 16 | 0x440` (n is not always the count of 0x41 entries: 11
+//!       for 12 seen, so the entries are told apart by their tag)
+//! entries of 0x20 bytes from the end of the header, 0x41 ones first:
 //!   0x41  a descriptor the program reads: u32 0x41, u32 root type << 8 |
 //!         resource type (0 SRV, 1 sampler, 2 CBV, 3 UAV), u32 table offset
-//!         (dwords), u32 shader register, u32 first user-data dword,
-//!         u32 root slot << 16 | stride << 8 | descriptor dwords, then
-//!         u32 -1, u32 0
+//!         (dwords), u32 shader register, u32 stride (bytes; 0 for a CBV,
+//!         4 for an image), u32 root slot << 16 | first user-data dword << 8
+//!         | descriptor dwords, then u32 -1, u32 0
 //!   0x42  a table range (not read: the 0x41 entries name the same ranges)
 //!   0x43  the program's 128-bit hash, last
 //! ```
 //!
+//! The user-data dword is the one byte that agrees across a table: every
+//! entry of root slot k names dword 4 + k, which the program's
+//! `COMPUTE_PGM_RSRC2` user-SGPR count covers, and a fixed sampler 0. The
+//! u32 before it is 0x10 or 0x20 for buffer SRVs (a structured stride),
+//! which no user-SGPR count covers.
+//!
+//! Root type 0 is root constants (resource type 2): the program reads them
+//! as values straight from its user SGPRs (`v_mul_f32 v7, s5, v7`), so the
+//! descriptor dwords byte is their size in bytes. They give a root parameter
+//! and no used resource, as nothing is loaded through them.
+//!
 //! The registers of a compute program, 0x1c bytes: u32 flags (bit 5: 32
-//! lanes, as the container record's flags), u32, u32, u16 x2 and u32
-//! thread-group size, u32 `COMPUTE_PGM_RSRC1`, u32 `COMPUTE_PGM_RSRC2`.
+//! lanes, as the container record's flags), u32, u32, u16 x3 thread-group
+//! size and u16 not read, u32 `COMPUTE_PGM_RSRC1`, u32 `COMPUTE_PGM_RSRC2`.
 
 use super::{
     ABSENT, CS_RSRC2, CS_THREADS, ComputeIo, ENTRY_SIZE, MAX_UNPACKED, FSSM_HEADER, FSSM_VERSION, GRAPHICS_SLOT_COUNT, HwStage,
@@ -46,14 +58,14 @@ fn resources(table: &[u8]) -> Result<(Vec<RootParam>, Vec<UsedResource>), Shader
     if table.len().checked_sub(header - 4) != Some(size) {
         return Err(Malformed("resource table size disagrees"));
     }
-    let count = (u32_at(table, header - 4)? >> 16) as usize;
     let (entries, tail) = table[header..].as_chunks::<0x20>();
     let Some((hash, entries)) = entries.split_last() else {
         return Err(Malformed("missing resource table hash"));
     };
-    if !tail.is_empty() || u32_at(hash, 0)? != 0x43 || count > entries.len() {
+    if !tail.is_empty() || u32_at(hash, 0)? != 0x43 {
         return Err(Malformed("incomplete resource table"));
     }
+    let count = entries.iter().take_while(|entry| super::le32(entry.as_slice(), 0) == 0x41).count();
     let (descriptors, ranges) = entries.split_at(count);
     if ranges.iter().any(|entry| super::le32(entry, 0) != 0x42) {
         return Err(Malformed("unexpected resource range"));
@@ -61,15 +73,26 @@ fn resources(table: &[u8]) -> Result<(Vec<RootParam>, Vec<UsedResource>), Shader
     let (mut layout, mut used) = (Vec::new(), Vec::new());
     for entry in descriptors {
         let word = |k: usize| u32::from_le_bytes(entry[4 * k..4 * k + 4].try_into().unwrap());
-        if word(0) != 0x41 {
-            return Err(Malformed("unexpected resource descriptor"));
-        }
-        let (types, offset, register, user_data, packed) =
+        let (types, offset, register, stride, packed) =
             (word(1), word(2), word(3), word(4), word(5));
         let root = RootType::from_raw(types >> 8);
         let slot = u8::try_from(packed >> 16).map_err(|_| Malformed("implausible root slot"))?;
-        let user_data =
-            u8::try_from(user_data).map_err(|_| Malformed("implausible user-data dword"))?;
+        let user_data = (packed >> 8) as u8;
+        if root == RootType::Constants {
+            let bytes = packed & 0xFF;
+            if bytes == 0 || !bytes.is_multiple_of(4) {
+                return Err(Malformed("implausible root constants size"));
+            }
+            layout.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: bytes / 4,
+                base_register: register,
+                user_data,
+                slot,
+            });
+            continue;
+        }
         used.push(UsedResource {
             kind: match types & 0xFF {
                 0 => ResourceType::Srv,
@@ -81,7 +104,7 @@ fn resources(table: &[u8]) -> Result<(Vec<RootParam>, Vec<UsedResource>), Shader
             root,
             table_offset_dwords: offset,
             lower_bound: register,
-            stride: packed >> 8 & 0xFF,
+            stride,
             dwords: packed as u8,
             user_data,
             slot,
@@ -128,7 +151,9 @@ fn console_compute(
     }
     let flags = u32_at(registers, 0)?;
     let size = u32_at(registers, 0x0c)?;
-    let threads = [size & 0xFFFF, size >> 16, u32_at(registers, 0x10)?];
+    // The depth is the low half of its word; the high half holds something
+    // else (0x10 seen with 32 x 1 x 1 groups).
+    let threads = [size & 0xFFFF, size >> 16, u32_at(registers, 0x10)? & 0xFFFF];
     let rsrc1 = u32_at(registers, 0x14)?;
     let rsrc2 = u32_at(registers, 0x18)?;
     if threads.contains(&0)
@@ -147,6 +172,11 @@ fn console_compute(
         return Err(Malformed("invalid compute register count or code length"));
     }
     let (layout, used) = resources(table)?;
+    // COMPUTE_PGM_RSRC2.USER_SGPR: what the root parameters can name.
+    let user_sgprs = rsrc2 >> 1 & 0x1F;
+    if layout.iter().any(|p| u32::from(p.user_data) + p.sgprs > user_sgprs) {
+        return Err(Malformed("a resource table names user data the program does not have"));
+    }
     let code = trimmed(code);
     if code.is_empty() {
         return Err(Malformed("no code"));
@@ -390,7 +420,8 @@ mod tests {
         for end in 0..t.len() {
             assert!(console_compute(&regs, &t[..end], &code).is_err());
         }
-        for (offset, value) in [(20, 20u32 << 16), (24, 0x44), (t.len() - 32, 0x42)] {
+        // Root constants of no size, an unknown tag, no hash.
+        for (offset, value) in [(t.len() - 64, 0x41u32), (24, 0x44), (t.len() - 32, 0x42)] {
             let mut bad = t.clone();
             bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             assert!(console_compute(&regs, &bad, &code).is_err());
@@ -400,6 +431,73 @@ mod tests {
         let mut large = regs;
         large[12..16].copy_from_slice(&(64u32 << 16 | 32).to_le_bytes());
         assert!(console_compute(&large, &t, &code).is_err());
+    }
+
+    /// As a title's table (a program with seven user SGPRs): a header count
+    /// one short of the 0x41 entries, two root slots whose entries name
+    /// user-data dwords 4 and 5, structured buffer SRVs of a 16-byte stride.
+    #[test]
+    fn entries_name_their_user_data_and_stride_as_a_title_does() {
+        let mut t = Vec::new();
+        for w in [0x403u32, 0, 0, 0, 0, 2 << 16 | 0x440] {
+            t.extend(w.to_le_bytes());
+        }
+        let mut entry = |words: [u32; 8]| t.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        entry([0x41, 0x401, 0, 0, 0, 2 << 16 | 4, u32::MAX, 0]);
+        entry([0x41, 0x300, 0x130, 0x48, 0x10, 0x404, u32::MAX, 0]);
+        entry([0x41, 0x303, 0x28, 0x16, 4, 1 << 16 | 0x508, u32::MAX, 0]);
+        entry([0x42, 0, 0xc_0001, 0x48, 0, 0, u32::MAX, 0]);
+        entry([0x43, 1, 2, 3, 4, 0, 0, 0]);
+        let size = (t.len() - 0x14) as u32;
+        t[4..8].copy_from_slice(&size.to_le_bytes());
+        let mut regs = registers();
+        regs[0x18..0x1c].copy_from_slice(&(7u32 << 1).to_le_bytes());
+        let code = 0xBF81_0000u32.to_le_bytes();
+        let p = console_compute(&regs, &t, &code).unwrap();
+        let named: Vec<_> = p.used.iter().map(|u| (u.slot, u.user_data, u.stride)).collect();
+        assert_eq!(named, [(2, 0, 0), (0, 4, 16), (1, 5, 4)]);
+        assert_eq!(p.layout.iter().map(|l| l.user_data).collect::<Vec<_>>(), [0, 4, 5]);
+        // Five user SGPRs do not reach dword 5.
+        regs[0x18..0x1c].copy_from_slice(&(5u32 << 1).to_le_bytes());
+        assert!(console_compute(&regs, &t, &code).is_err());
+    }
+
+    /// A title's gamma pass: a UAV table in dword 4 and one root constant
+    /// in dword 5, read as a value; and a depth word whose high half is not
+    /// the depth.
+    #[test]
+    fn root_constants_are_a_root_parameter_and_the_depth_its_low_half() {
+        let mut t = Vec::new();
+        for w in [0x403u32, 0, 0, 0, 0, 2 << 16 | 0x440] {
+            t.extend(w.to_le_bytes());
+        }
+        let mut entry = |words: [u32; 8]| t.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        entry([0x41, 0x303, 0, 0x37, 4, 0x408, u32::MAX, 0]);
+        entry([0x41, 0x002, 0, 0x1f6, 0, 1 << 16 | 0x504, u32::MAX, 0]);
+        entry([0x42, 0, 0x2_0101, 0x37, 1, 0, u32::MAX, 0]);
+        entry([0x43, 1, 2, 3, 4, 0, 0, 0]);
+        let size = (t.len() - 0x14) as u32;
+        t[4..8].copy_from_slice(&size.to_le_bytes());
+        let mut regs = registers();
+        regs[0x0c..0x10].copy_from_slice(&(1u32 << 16 | 32).to_le_bytes());
+        regs[0x10..0x14].copy_from_slice(&0x0010_0001u32.to_le_bytes());
+        regs[0x18..0x1c].copy_from_slice(&0x98cu32.to_le_bytes());
+        let code = 0xBF81_0000u32.to_le_bytes();
+        let p = console_compute(&regs, &t, &code).unwrap();
+        let StageIo::Cs(cs) = p.io else { panic!() };
+        assert_eq!(cs.threads, [32, 1, 1]);
+        assert_eq!(p.used.len(), 1, "constants are not a resource read");
+        assert_eq!(
+            p.layout[1],
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0x1f6,
+                user_data: 5,
+                slot: 1,
+            }
+        );
     }
 
     #[test]
