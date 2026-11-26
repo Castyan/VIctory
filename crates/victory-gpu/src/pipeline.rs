@@ -679,8 +679,10 @@ pub(crate) extern "system" fn create_compute_x(
 /// The code is not that of the title's container of the same program: it is
 /// compiled again, for a root signature whose table can hold more ranges.
 /// So the program is read from the record
-/// ([`victory_shader::native::console_compute_container`]) and put in a container of
-/// its own, which is translated and cached as the title's containers are.
+/// ([`victory_shader::native::console_compute_container_rooted`], with the
+/// root signature's parameters the table does not name) and put in a
+/// container of its own, which is translated and cached as the title's
+/// containers are.
 pub(crate) extern "system" fn create_native_compute(
     _: This,
     desc: *const u8,
@@ -697,7 +699,9 @@ pub(crate) extern "system" fn create_native_compute(
         let registers = title_bytes(desc, 1).map_err(|e| format!("registers: {e}"))?;
         let code = title_bytes(desc, 5).map_err(|e| format!("code: {e}"))?;
         let table = title_bytes(desc, 7).map_err(|e| format!("resource table: {e}"))?;
-        victory_shader::native::console_compute_container(&registers, &table, &code).map_err(|e| e.to_string())
+        let root = root_blob(desc);
+        victory_shader::native::console_compute_container_rooted(&registers, &table, &code, root.as_deref())
+            .map_err(|e| e.to_string())
     })();
     let made = MADE[usize::from(program.is_err())].fetch_add(1, Ordering::Relaxed) + 1;
     let container = match program {

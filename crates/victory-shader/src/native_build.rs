@@ -156,6 +156,139 @@ fn trimmed(code: &[u8]) -> &[u8] {
     &code[..end]
 }
 
+/// A root parameter of a serialized root signature: what it is, the
+/// user-data dwords it takes and its shader register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SerializedParam {
+    root: RootType,
+    dwords: u32,
+    register: u32,
+}
+
+/// `D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and
+/// `D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED`.
+const HEAPS_INDEXED: u32 = 0xC00;
+
+/// The parameters and flags of a serialized root signature (an `RTS0`
+/// part, alone or in a container): a header of u32 version (1 to 3),
+/// parameter count, parameter offset, sampler count, sampler offset and
+/// flags, then per parameter u32 type, visibility and payload offset. A
+/// table (0) takes one user-data dword, root constants (1) as many as their
+/// count (the payload's third u32), a root CBV (2) two. Root SRVs and UAVs
+/// (3, 4) are refused: no captured table places one.
+fn root_signature(blob: &[u8]) -> Result<(Vec<SerializedParam>, u32), ShaderError> {
+    let rts0 = match crate::Container::parse(blob) {
+        Ok(c) => {
+            c.part(FourCC::RTS0)
+                .ok_or(Malformed("a root signature container without RTS0"))?
+                .data
+        }
+        Err(_) => blob,
+    };
+    if !(1..=3).contains(&u32_at(rts0, 0)?) {
+        return Err(Malformed("unknown root signature version"));
+    }
+    let (count, at, flags) = (u32_at(rts0, 4)?, u32_at(rts0, 8)? as usize, u32_at(rts0, 20)?);
+    if count > 64 {
+        return Err(Malformed("implausible root parameter count"));
+    }
+    let params = (0..count as usize)
+        .map(|k| {
+            let entry = at + 12 * k;
+            let payload = u32_at(rts0, entry + 8)? as usize;
+            let (root, dwords) = match u32_at(rts0, entry)? {
+                0 => (RootType::Table, 1),
+                1 => (RootType::Constants, u32_at(rts0, payload + 8)?),
+                2 => (RootType::Descriptor, 2),
+                3 | 4 => {
+                    return Err(Malformed(
+                        "a root SRV or UAV, whose user data no capture places",
+                    ));
+                }
+                _ => return Err(Malformed("unknown root parameter type")),
+            };
+            let register = if root == RootType::Table { 0 } else { u32_at(rts0, payload)? };
+            Ok(SerializedParam { root, dwords, register })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((params, flags))
+}
+
+/// The root parameters a resource table leaves out, from the root
+/// signature the title passes with it: a 0x218 program reads user SGPRs
+/// that no table entry names (`slot218-m007`: a descriptor loaded from
+/// s[10:11] plus s9 << 5, with entries for dwords 4 to 6 only).
+///
+/// Every captured table places the parameters from user-data dword 4 on,
+/// in order, a table taking one dword, root constants their count, a root
+/// CBV two (slot 0 at 4 even when unnamed, a root CBV at 7 taking 7 and 8,
+/// the constants after it at 9), so the others are placed the same way.
+/// Nothing is guessed: the program is refused when the table places a
+/// parameter elsewhere, when a parameter is cut by the end of the
+/// program's user SGPRs, and when user SGPRs are left past the parameters
+/// (where a directly indexed heap would be, which no capture places).
+fn completed(
+    layout: &[RootParam],
+    params: &[SerializedParam],
+    flags: u32,
+    user_sgprs: u32,
+) -> Result<Vec<RootParam>, ShaderError> {
+    let mut at = Vec::with_capacity(params.len());
+    let mut end = 4u32;
+    for p in params {
+        at.push(end);
+        end = end
+            .checked_add(p.dwords)
+            .ok_or(Malformed("implausible root constants size"))?;
+    }
+    let named = |k: usize| {
+        layout
+            .iter()
+            .filter(|l| l.root != RootType::ImmediateSampler)
+            .any(|l| usize::from(l.slot) == k)
+    };
+    let agrees = layout
+        .iter()
+        .filter(|l| l.root != RootType::ImmediateSampler)
+        .all(|l| {
+            let k = usize::from(l.slot);
+            params.get(k).is_some_and(|p| p.root == l.root) && at[k] == u32::from(l.user_data)
+        });
+    if !agrees {
+        return Err(Malformed(
+            "a resource table places a root parameter where its root signature does not",
+        ));
+    }
+    let mut out = layout.to_vec();
+    for (k, p) in params.iter().enumerate() {
+        let (first, past) = (at[k], at[k] + p.dwords);
+        if named(k) || first >= user_sgprs {
+            continue;
+        }
+        if past > user_sgprs {
+            return Err(Malformed(
+                "a root parameter cut by the end of the program's user SGPRs",
+            ));
+        }
+        out.push(RootParam {
+            root: p.root,
+            table_offset_dwords: 0,
+            sgprs: p.dwords,
+            base_register: p.register,
+            user_data: first as u8,
+            slot: k as u8,
+        });
+    }
+    if end < user_sgprs {
+        return Err(Malformed(if flags & HEAPS_INDEXED != 0 {
+            "user SGPRs past the root parameters, where a directly indexed heap would be: no capture places it"
+        } else {
+            "user SGPRs past the root parameters"
+        }));
+    }
+    Ok(out)
+}
+
 /// A compute program from its registers (0x1c bytes), resource table and
 /// code, as the title hands them to device method 0x218.
 fn console_compute(
@@ -237,7 +370,27 @@ pub fn console_compute_container(
     table: &[u8],
     code: &[u8],
 ) -> Result<Vec<u8>, ShaderError> {
-    let program = console_compute(registers, table, code)?;
+    console_compute_container_rooted(registers, table, code, None)
+}
+
+/// [`console_compute_container`], the program's layout completed from the
+/// serialized root signature the description names ([`completed`]), or
+/// refused when the signature cannot be read or places something no
+/// capture shows. Without a signature, the table's layout alone, as
+/// [`console_compute_container`].
+pub fn console_compute_container_rooted(
+    registers: &[u8],
+    table: &[u8],
+    code: &[u8],
+    root: Option<&[u8]>,
+) -> Result<Vec<u8>, ShaderError> {
+    let mut program = console_compute(registers, table, code)?;
+    if let Some(root) = root
+        && let StageIo::Cs(cs) = &program.io
+    {
+        let (params, flags) = root_signature(root)?;
+        program.layout = completed(&program.layout, &params, flags, cs.rsrc2 >> 1 & 0x1F)?;
+    }
     compute_container(&program)
 }
 
@@ -600,6 +753,122 @@ mod tests {
             super::super::native_programs(c.part(FourCC::DXIL).unwrap().data).unwrap(),
             vec![p]
         );
+    }
+
+    /// A serialized root signature (version 1.1): per parameter its type and
+    /// payload (register, space, and for root constants their count).
+    fn rts0(params: &[(u32, [u32; 3])], flags: u32) -> Vec<u8> {
+        let n = params.len() as u32;
+        let mut words = vec![2, n, 24, 0, 24 + 24 * n, flags];
+        for (k, (kind, _)) in params.iter().enumerate() {
+            words.extend([*kind, 0, 24 + 12 * n + 12 * k as u32]);
+        }
+        for (_, payload) in params {
+            words.extend(payload);
+        }
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// As the title's `slot218-m007`: tables in user-data dwords 4 and 5 and
+    /// a root constant in 6 named, eleven user SGPRs.
+    fn named() -> Vec<RootParam> {
+        let p = |root, user_data, sgprs, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        vec![
+            p(RootType::Table, 4, 1, 0),
+            p(RootType::Table, 5, 1, 1),
+            p(RootType::Constants, 6, 1, 2),
+        ]
+    }
+
+    #[test]
+    fn a_root_signature_completes_what_the_table_leaves_out() {
+        // m007's eleven user SGPRs: three constants in 7 to 9 would leave
+        // dword 10 to a heap.
+        let params = [(0, [0; 3]), (0, [0; 3]), (1, [0x1f5, 0, 1]), (1, [0x1f6, 0, 3])];
+        let (four, flags) = root_signature(&rts0(&params, 0)).unwrap();
+        let layout = completed(&named(), &four, flags, 10).unwrap();
+        assert_eq!(&layout[..3], named().as_slice());
+        assert_eq!(
+            layout[3..],
+            [RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 3,
+                base_register: 0x1f6,
+                user_data: 7,
+                slot: 3,
+            }]
+        );
+        // Without the user SGPRs for it, nothing more.
+        assert_eq!(completed(&named(), &four, flags, 7).unwrap(), named());
+        let refused = |r: Result<Vec<RootParam>, ShaderError>| match r {
+            Err(Malformed(why)) => why,
+            r => panic!("{r:?}"),
+        };
+        // A user SGPR past the parameters: a heap, whose place is not guessed.
+        let (_, heaps) = root_signature(&rts0(&params, 0x400)).unwrap();
+        assert!(refused(completed(&named(), &four, heaps, 11)).contains("directly indexed heap"));
+        assert_eq!(
+            refused(completed(&named(), &four, 0, 11)),
+            "user SGPRs past the root parameters"
+        );
+        // Constants cut by the end of the user SGPRs.
+        assert!(refused(completed(&named(), &four, 0, 8)).contains("cut by the end"));
+        // A table that places a parameter elsewhere, or names another type.
+        let mut moved = named();
+        moved[2].user_data = 7;
+        assert!(refused(completed(&moved, &four, 0, 10)).contains("places a root parameter"));
+        let (tables, _) = root_signature(&rts0(&[(0, [0; 3]); 4], 0)).unwrap();
+        assert!(refused(completed(&named(), &tables, 0, 10)).contains("places a root parameter"));
+        // Root SRVs and UAVs, which no table places, and short blobs.
+        assert!(root_signature(&rts0(&[(3, [0; 3])], 0)).is_err());
+        assert!(root_signature(&rts0(&[(4, [0; 3])], 0)).is_err());
+        assert!(root_signature(&rts0(&params, 0)[..20]).is_err());
+    }
+
+    #[test]
+    fn the_container_holds_what_the_root_signature_adds() {
+        let mut regs = registers();
+        regs[0x18..0x1c].copy_from_slice(&(10u32 << 1).to_le_bytes());
+        let code = 0xBF81_0000u32.to_le_bytes();
+        // A table entry in dword 4 for slot 0; the signature's root CBV and
+        // constants follow, the second table being slot 1 at 5.
+        let mut t = Vec::new();
+        for w in [0x403u32, 0, 0, 0, 0, 1 << 16 | 0x440] {
+            t.extend(w.to_le_bytes());
+        }
+        let mut entry = |words: [u32; 8]| t.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        entry([0x41, 0x303, 0, 2, 4, 0x408, u32::MAX, 0]);
+        entry([0x43, 1, 2, 3, 4, 0, 0, 0]);
+        let size = (t.len() - 0x14) as u32;
+        t[4..8].copy_from_slice(&size.to_le_bytes());
+        let root = rts0(&[(0, [0; 3]), (0, [0; 3]), (2, [3, 0, 0]), (1, [7, 0, 2])], 0);
+        let root = dxbc::build(&[(FourCC::RTS0, &root)]);
+        let bytes = console_compute_container_rooted(&regs, &t, &code, Some(&root)).unwrap();
+        let c = crate::Container::parse(&bytes).unwrap();
+        let p = super::super::native_programs(c.part(FourCC::DXIL).unwrap().data).unwrap();
+        let placed: Vec<_> = p[0].layout.iter().map(|l| (l.root, l.slot, l.user_data, l.sgprs)).collect();
+        assert_eq!(
+            placed,
+            [
+                (RootType::Table, 0, 4, 1),
+                (RootType::Table, 1, 5, 1),
+                (RootType::Descriptor, 2, 6, 2),
+                (RootType::Constants, 3, 8, 2),
+            ]
+        );
+        // Without a signature, the table alone; one that cannot be read is
+        // refused.
+        let plain = console_compute_container_rooted(&regs, &t, &code, None).unwrap();
+        assert_eq!(plain, console_compute_container(&regs, &t, &code).unwrap());
+        assert!(console_compute_container_rooted(&regs, &t, &code, Some(b"RTS0")).is_err());
     }
 
     #[test]

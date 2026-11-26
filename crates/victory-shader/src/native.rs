@@ -74,7 +74,7 @@ use crate::dxbc::{u32_at, u64_at};
 /// Programs handed to us compiled, outside a container, and a container for them.
 #[path = "native_build.rs"]
 mod build;
-pub use build::console_compute_container;
+pub use build::{console_compute_container, console_compute_container_rooted};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
