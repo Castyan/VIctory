@@ -715,6 +715,13 @@ pub(crate) extern "system" fn create_native_compute(
             return crate::object::E_NOTIMPL;
         }
     };
+    // With VICTORY_DUMP_NATIVE, a description whose program does not
+    // translate is saved too.
+    if dumping()
+        && let Err(e) = victory_shader::emit::translate(&container)
+    {
+        dump_native(desc, &format!("translation: {e}"));
+    }
     let shader = shader("compute", &container);
     if made.is_power_of_two() {
         tracing::info!(made, hash = %shader.hash, "native compute descriptions decoded");
@@ -761,18 +768,46 @@ fn title_bytes(desc: *const u8, at: usize) -> Result<Vec<u8>, String> {
     }
 }
 
+/// The serialized root signature word 0 of a 0x218 description names, if
+/// it is one of ours.
+fn root_blob(desc: *const u8) -> Option<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        crate::root::blob_of(title_words(desc)?[0] as usize as This)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = desc;
+        None
+    }
+}
+
+/// The folder `VICTORY_DUMP_NATIVE` names, if set.
+fn dump_folder() -> Option<&'static std::path::Path> {
+    use std::sync::OnceLock;
+    static FOLDER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    FOLDER
+        .get_or_init(|| std::env::var_os("VICTORY_DUMP_NATIVE").map(std::path::PathBuf::from))
+        .as_deref()
+}
+
+fn dumping() -> bool {
+    dump_folder().is_some()
+}
+
 /// `VICTORY_DUMP_NATIVE=<folder>`: a description device method 0x218 could
-/// not read is saved there, with the blocks it names, as
-/// `slot218-<n>-desc-<address>.bin` and `slot218-<n>-dNN-<address>-<size>.bin`
-/// (what `pr64-replay` reads); four of each reason, 200 in all.
+/// not read, or whose program does not translate, is saved there, with the
+/// blocks it names, as `slot218-<n>-desc-<address>.bin`,
+/// `slot218-<n>-dNN-<address>-<size>.bin` and its root signature's
+/// serialized form as `slot218-<n>-root.bin` (what `pr64-replay` reads);
+/// four of each reason, 200 in all.
 fn dump_native(desc: *const u8, why: &str) {
     #[cfg(windows)]
     {
         use std::collections::HashMap;
-        use std::sync::{Mutex, OnceLock};
-        static FOLDER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+        use std::sync::Mutex;
         static SEEN: Mutex<Option<(u32, HashMap<String, u32>)>> = Mutex::new(None);
-        let Some(folder) = FOLDER.get_or_init(|| std::env::var_os("VICTORY_DUMP_NATIVE").map(std::path::PathBuf::from)) else {
+        let Some(folder) = dump_folder() else {
             return;
         };
         let Some(words) = title_words(desc) else { return };
@@ -799,6 +834,9 @@ fn dump_native(desc: *const u8, why: &str) {
             if crate::host::read_into(address as *const u8, &mut block) {
                 let _ = std::fs::write(folder.join(format!("slot218-m{n:03}-d{at:02}-{address:x}-{size:x}.bin")), block);
             }
+        }
+        if let Some(root) = root_blob(desc) {
+            let _ = std::fs::write(folder.join(format!("slot218-m{n:03}-root.bin")), root);
         }
         let _ = std::fs::write(folder.join(format!("slot218-m{n:03}-why.txt")), why);
     }
