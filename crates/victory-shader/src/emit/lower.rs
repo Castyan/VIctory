@@ -15,7 +15,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -2464,8 +2464,11 @@ impl<'a> Lower<'a> {
                     None if super::pops::collision_register(self.x.native) == Some(n) => {
                         Val::I32(self.s.m.i32(super::pops::NO_COLLISION))
                     }
-                    // Treat SGPRs above the hardware inputs like unset VGPRs.
-                    None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
+                    // Treat SGPRs above the hardware inputs like unset VGPRs, and VCC, which a
+                    // compute wave starts with as the previous wave left it too.
+                    None if (n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k))
+                        || (n == VCC || n == VCC + 1) && self.x.io.initialized_sgprs.is_some() =>
+                    {
                         Val::I32(self.s.m.i32(0))
                     }
                     // A scalar parked in a VGPR lane (`ir::unspill`), read where the
@@ -7359,7 +7362,7 @@ impl<'a> Lower<'a> {
             "v_div_fmas_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let m = inst
-                    .read(Reg::S(crate::ir::VCC))
+                    .read(Reg::S(VCC))
                     .and_then(|v| self.x.st.masks.get(&v).copied())
                     .ok_or("v_div_fmas_f32 without VCC")?;
                 let vcc = self.boolean(m, c)?;

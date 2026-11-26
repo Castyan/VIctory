@@ -1763,3 +1763,37 @@ fn a_section_left_for_lane_0_alone_stores_the_consoles_sum_from_lane_0() {
     as_on_the_console(&native, &console, 2);
 }
 
+// ---- VCC on entry ----
+
+/// VCC on entry, which a compute wave starts with as the previous wave left it, reaching a
+/// mask only on the `execz` edge, where EXEC is 0 (run4 0x218 m159 at 0xe8-0x15c and 0x21c,
+/// m160 and m162 at 0xf4-0x168): `v_cmpx_gt_u32 exec, s0, v0`, a skip past
+/// `v_cmp_gt_u32 vcc, s1, v0` when no thread is below s0, then `s_orn2 s20, vcc, exec`,
+/// `s_not s21, s20` and EXEC set to s21: the threads below s0 and not below s1 store 1, and
+/// after the skip none does, whatever VCC held. The title's form (32-lane console waves,
+/// `_b32`) and the 64-lane one, as `emit` gives them to a host of 32-lane waves.
+#[test]
+fn vcc_on_entry_masked_off_by_exec_is_not_read() {
+    for wave64 in [false, true] {
+        let (lanes, b64) = if wave64 { (64, 1) } else { (32, 0) };
+        let mut w = vec![
+            vop2(0x1A, 15, k(2), 0),         // v_lshlrev_b32 v15, 2, v0
+            vop1(0x01, 1, k(1)),             // v_mov_b32 v1, 1
+            vopc(0xD4, 0, 0),                // v_cmpx_gt_u32 exec, s0, v0
+            sopp(0x08, 1),                   // s_cbranch_execz past the compare
+            vopc(0xC4, 1, 0),                // v_cmp_gt_u32 vcc, s1, v0
+            sop2(0x16 + b64, 20, VCC, EXEC), // s_orn2_b32/b64 s20, vcc, exec
+            sop1(0x07 + b64, 22, 20),        // s_not_b32/b64 s22, s20
+            sop1(0x03 + b64, EXEC, 22),      // s_mov_b32/b64 exec, s22
+        ];
+        w.extend(store(1, 15, 0));
+        let native = native_of(&w, wave64, lanes);
+        let shader = chosen_for_32_lanes(&native);
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (s0, s1) in [(0, 0), (0, 40), (20, 10), (20, 30), (64, 64), (33, 5), (1, 0)] {
+            let Some(got) = run_paired(&shader, [s0, s1, 0, 0], lanes) else { return };
+            let console: Vec<u32> = (0..lanes).map(|t| u32::from(t < s0 && t >= s1)).collect();
+            assert_eq!(got, console, "wave64 {wave64}, s0 {s0}, s1 {s1}");
+        }
+    }
+}
