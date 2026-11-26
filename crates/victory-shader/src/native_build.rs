@@ -302,12 +302,32 @@ fn completed(
             slot: k as u8,
         });
     }
-    // User SGPRs past the parameters are left unnamed. Of 200 descriptions
-    // captured in game, 196 have none, and the 4 with one more have a
-    // directly indexed heap in their signature but never read that SGPR.
-    // A program that reads one is still refused by the translator ("a
-    // hardware SGPR input"): nothing is placed there by guess.
-    let _ = (end, flags & HEAPS_INDEXED);
+    // A directly indexed heap takes one user-data dword past the root
+    // parameters, the view heap's first, then the sampler heap's: in two
+    // game runs' captures, every program with the view heap flag has one
+    // user SGPR more than its parameters take, and every one with both
+    // flags two, and nothing else has any (the first is the view heap: the
+    // programs load buffer descriptors from it, `s_load_dwordx4` at the
+    // dword plus an offset, and read their stride). User SGPRs that this
+    // does not account for exactly are left unnamed: a program that reads
+    // one is refused by the translator ("a hardware SGPR input").
+    let heaps: Vec<RootType> = [(0x400, RootType::ResourceHeap), (0x800, RootType::SamplerHeap)]
+        .into_iter()
+        .filter(|&(bit, _)| flags & HEAPS_INDEXED & bit != 0)
+        .map(|(_, root)| root)
+        .collect();
+    if end + heaps.len() as u32 == user_sgprs {
+        for (k, root) in heaps.into_iter().enumerate() {
+            out.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: (end + k as u32) as u8,
+                slot: (params.len() + k) as u8,
+            });
+        }
+    }
     Ok(out)
 }
 
@@ -834,11 +854,27 @@ mod tests {
             Err(Malformed(why)) => why,
             r => panic!("{r:?}"),
         };
-        // A user SGPR past the parameters (where a directly indexed heap
-        // would be) is left unnamed: nothing is placed there.
-        let (_, heaps) = root_signature(&rts0(&params, 0x400)).unwrap();
-        assert_eq!(completed(&named(), &four, heaps, 11).unwrap(), layout);
+        // The view heap in the dword past the parameters, then the sampler
+        // heap; user SGPRs the heaps do not account for exactly stay
+        // unnamed.
+        let heap = |root, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let (_, views) = root_signature(&rts0(&params, 0x400)).unwrap();
+        let mut with_view = layout.clone();
+        with_view.push(heap(RootType::ResourceHeap, 10, 4));
+        assert_eq!(completed(&named(), &four, views, 11).unwrap(), with_view);
+        let mut with_both = with_view.clone();
+        with_both.push(heap(RootType::SamplerHeap, 11, 5));
+        assert_eq!(completed(&named(), &four, 0xC00, 12).unwrap(), with_both);
         assert_eq!(completed(&named(), &four, 0, 11).unwrap(), layout);
+        assert_eq!(completed(&named(), &four, views, 12).unwrap(), layout);
+        assert_eq!(completed(&named(), &four, 0xC00, 11).unwrap(), layout);
         // Constants cut by the end of the user SGPRs.
         assert!(refused(completed(&named(), &four, 0, 8)).contains("cut by the end"));
         // A table that places a parameter elsewhere, or names another type.
