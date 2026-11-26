@@ -548,8 +548,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             };
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
+                // (a lane's own value is that lane's, not every lane's)
                 let s = l
                     .and_then(|l| x.get(l as usize).copied())
+                    .filter(|s| !matches!(s, Sym::Own(_)))
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
             }

@@ -1299,6 +1299,67 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
 
+// ---- a lane read inside a whole-wave section of a value from before it ----
+
+/// One console wave of 64 threads: inside a whole-wave section, lane 3 of v1 = t + 1, set
+/// before the section, read to s14 and stored by every thread to its dword (4 every thread).
+/// The section's simulation knows v1 only as each lane's own value, not lane 3's: it may not
+/// give s14 as each lane's v1. Each form that takes the program stores what the console does.
+#[test]
+fn a_lane_read_in_a_section_of_a_value_from_before_it_is_that_lane() {
+    let w = [
+        vop2(0x25, 1, k(1), 0), // v_add_nc_u32 v1, 1, v0
+        sop1(0x25, 12, k(65)),  // s_or_saveexec_b64 s[12:13], -1
+        0xD760_000E,
+        0x0001_0701,             // v_readlane_b32 s14, v1, 3
+        sop1(0x04, EXEC, 12),    // s_mov_b64 exec, s[12:13]
+        vop1(0x01, 3, 14),       // v_mov_b32 v3, s14
+        vop2(0x1A, 15, k(2), 0), // v_lshlrev_b32 v15, 2, v0
+        store(3, 15, 0)[0],
+        store(3, 15, 0)[1],
+    ];
+    let native = native(&w);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let narrow = super::emit(&c, &native, &p, &st, &io, &res);
+    let pair = super::paired(&c, &native, &p, &io, &res).map(|(s, _)| s);
+    lower::TEST_HOST_WAVE.set(was);
+    let wide = lowered_for_width(&native, &p, &HashSet::new(), 64);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (shader, form) in [(wide, "64-lane waves"), (narrow, "the form emit chooses"), (pair, "the paired form")] {
+        let Ok(shader) = shader else {
+            eprintln!("{form}: not translated");
+            continue;
+        };
+        match run_once(false, &shader, 64) {
+            Some(got) => assert!(got.iter().all(|&x| x == 4), "{form}: {got:?}, the console's 4 in every thread"),
+            None => eprintln!("no device that takes {form}; not run"),
+        }
+    }
+}
+
+/// `shader` on WARP or the hardware device: one group, zero root constants, a raw UAV of
+/// `dwords` zeroed dwords, which come back; None (and a line) without a device that takes it.
+fn run_once(warp: bool, shader: &HostShader, dwords: u32) -> Option<Vec<u32>> {
+    let host = Host::new(warp).map_err(|e| eprintln!("device: {e}")).ok()?;
+    let (root, pso) = host.compute_pipeline(shader).map_err(|e| eprintln!("pipeline: {e}")).ok()?;
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let mut out = host
+        .dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(ud))],
+            views: &[View::RawUav(dwords)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        })
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out.swap_remove(0))
+}
+
 // ---- lane masks the code sets to constant lanes ----
 
 /// One console wave of 64 threads; thread t stores t + 1 to dwords 0..7 of its sixteen (64
