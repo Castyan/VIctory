@@ -251,6 +251,12 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    translator's ids, then direct and indirect dispatch counts).
 8. Multi-wave groups with LDS.
 
+## RTX 5060 comparison with the double-precision port
+
+The Windows test build starts from [Marvisak/VIctory#2214](https://github.com/Marvisak/VIctory/pull/2214) at `b3efa1c`. It ports double-to-float conversion and whole-wave double-precision summation from the DexNom runtime. It adds DXIL double metadata and reuses the prototype's shared-memory exchange to combine the sums of the two host waves.
+
+On the 30 compute shaders refused by the combined preload build, the upstream baseline created 22 pipelines and the port created 24. The six remaining inputs stop at descriptor tracing (one), the shared-memory limit for multi-wave groups (two), or lane masks used as data (three). The five targeted console-wave tests and the binary64-to-binary32 conversion test passed. The title shader checks stopped at DXIL validation and D3D12 pipeline creation. [Preload baseline](https://github.com/DexNom/VIctory/pull/47)
+
 ## Credit
 
 The approach of pairing two 32-lane waves through groupshared memory, and
