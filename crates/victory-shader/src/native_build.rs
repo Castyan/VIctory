@@ -1,0 +1,436 @@
+//! Console programs that reach us compiled already, outside a container,
+//! and the container that holds such a program as the title's own do.
+//!
+//! A title can make a pipeline from a program it has put in its own memory
+//! (device methods 0x218 for compute, 0x1c8 for graphics). Such a program
+//! comes as its code, a block of registers and a resource table. The table,
+//! as observed (the title's mip generation programs, against their
+//! containers):
+//!
+//! ```text
+//! +0x00 u32 kind (bit 10: 8 bytes more of header), u32 size of the rest
+//!       (from +0x0c, or +0x14), u32, u32 ..., the last u32 of the header
+//!       holding the count of 0x41 entries in its high half (`n << 16 | 0x440`)
+//! entries of 0x20 bytes from the end of the header:
+//!   0x41  a descriptor the program reads: u32 0x41, u32 root type << 8 |
+//!         resource type (0 SRV, 1 sampler, 2 CBV, 3 UAV), u32 table offset
+//!         (dwords), u32 shader register, u32 first user-data dword,
+//!         u32 root slot << 16 | stride << 8 | descriptor dwords, then
+//!         u32 -1, u32 0
+//!   0x42  a table range (not read: the 0x41 entries name the same ranges)
+//!   0x43  the program's 128-bit hash, last
+//! ```
+//!
+//! The registers of a compute program, 0x1c bytes: u32 flags (bit 5: 32
+//! lanes, as the container record's flags), u32, u32, u16 x2 and u32
+//! thread-group size, u32 `COMPUTE_PGM_RSRC1`, u32 `COMPUTE_PGM_RSRC2`.
+
+use super::{
+    ABSENT, CS_RSRC2, CS_THREADS, ComputeIo, ENTRY_SIZE, MAX_UNPACKED, FSSM_HEADER, FSSM_VERSION, GRAPHICS_SLOT_COUNT, HwStage,
+    KIND_NATIVE, NativeProgram, RECORD_COUNTS, RECORD_FLAGS, RECORD_LAYOUT, RECORD_REGS,
+    RECORD_SIZE, RECORD_USED, ResourceType, RootParam, RootType, SLOTS, StageIo, UsedResource,
+    XBCH_HEADER, XBCH_VERSION, XDAT_OFFSET,
+};
+use crate::ShaderError::{self, Malformed};
+use crate::dxbc::u32_at;
+use crate::{FourCC, dxbc};
+
+const S_CODE_END: u32 = 0xBF9F_0000;
+
+/// The descriptors a console resource table names, and the root parameters
+/// they come through (one per table range, and one per fixed sampler).
+fn resources(table: &[u8]) -> Result<(Vec<RootParam>, Vec<UsedResource>), ShaderError> {
+    let kind = u32_at(table, 0)?;
+    let header = if kind & 0x400 != 0 { 0x18 } else { 0x10 };
+    let size = u32_at(table, 4)? as usize;
+    if table.len().checked_sub(header - 4) != Some(size) {
+        return Err(Malformed("resource table size disagrees"));
+    }
+    let count = (u32_at(table, header - 4)? >> 16) as usize;
+    let (entries, tail) = table[header..].as_chunks::<0x20>();
+    let Some((hash, entries)) = entries.split_last() else {
+        return Err(Malformed("missing resource table hash"));
+    };
+    if !tail.is_empty() || u32_at(hash, 0)? != 0x43 || count > entries.len() {
+        return Err(Malformed("incomplete resource table"));
+    }
+    let (descriptors, ranges) = entries.split_at(count);
+    if ranges.iter().any(|entry| super::le32(entry, 0) != 0x42) {
+        return Err(Malformed("unexpected resource range"));
+    }
+    let (mut layout, mut used) = (Vec::new(), Vec::new());
+    for entry in descriptors {
+        let word = |k: usize| u32::from_le_bytes(entry[4 * k..4 * k + 4].try_into().unwrap());
+        if word(0) != 0x41 {
+            return Err(Malformed("unexpected resource descriptor"));
+        }
+        let (types, offset, register, user_data, packed) =
+            (word(1), word(2), word(3), word(4), word(5));
+        let root = RootType::from_raw(types >> 8);
+        let slot = u8::try_from(packed >> 16).map_err(|_| Malformed("implausible root slot"))?;
+        let user_data =
+            u8::try_from(user_data).map_err(|_| Malformed("implausible user-data dword"))?;
+        used.push(UsedResource {
+            kind: match types & 0xFF {
+                0 => ResourceType::Srv,
+                1 => ResourceType::Sampler,
+                2 => ResourceType::Cbv,
+                3 => ResourceType::Uav,
+                n => ResourceType::Other(n as u8),
+            },
+            root,
+            table_offset_dwords: offset,
+            lower_bound: register,
+            stride: packed >> 8 & 0xFF,
+            dwords: packed as u8,
+            user_data,
+            slot,
+        });
+        let sgprs = match root {
+            RootType::Table => 1,
+            RootType::ImmediateSampler => 0,
+            _ => {
+                return Err(Malformed(
+                    "a console resource table entry of a root type not seen yet",
+                ));
+            }
+        };
+        layout.push(RootParam {
+            root,
+            table_offset_dwords: offset,
+            sgprs,
+            base_register: register,
+            user_data,
+            slot,
+        });
+    }
+    Ok((layout, used))
+}
+
+/// The code without the `s_code_end` the title pads it with.
+fn trimmed(code: &[u8]) -> &[u8] {
+    let mut end = code.len();
+    while end >= 4 && u32_at(code, end - 4).ok() == Some(S_CODE_END) {
+        end -= 4;
+    }
+    &code[..end]
+}
+
+/// A compute program from its registers (0x1c bytes), resource table and
+/// code, as the title hands them to device method 0x218.
+fn console_compute(
+    registers: &[u8],
+    table: &[u8],
+    code: &[u8],
+) -> Result<NativeProgram, ShaderError> {
+    if registers.len() < 0x1c {
+        return Err(Malformed("compute registers too short"));
+    }
+    let flags = u32_at(registers, 0)?;
+    let size = u32_at(registers, 0x0c)?;
+    let threads = [size & 0xFFFF, size >> 16, u32_at(registers, 0x10)?];
+    let rsrc1 = u32_at(registers, 0x14)?;
+    let rsrc2 = u32_at(registers, 0x18)?;
+    if threads.contains(&0)
+        || threads[2] > 64
+        || threads
+            .into_iter()
+            .try_fold(1u32, u32::checked_mul)
+            .is_none_or(|lanes| lanes > 1024)
+    {
+        return Err(Malformed("implausible thread-group size"));
+    }
+    let wave64 = flags & super::FLAG_WAVE32 == 0;
+    // COMPUTE_PGM_RSRC1.VGPRS: granules of 4 (64 lanes) or 8 (32 lanes), less one.
+    let vgprs = ((rsrc1 & 0x3F) + 1) * if wave64 { 4 } else { 8 };
+    if vgprs > 256 || !code.len().is_multiple_of(4) {
+        return Err(Malformed("invalid compute register count or code length"));
+    }
+    let (layout, used) = resources(table)?;
+    let code = trimmed(code);
+    if code.is_empty() {
+        return Err(Malformed("no code"));
+    }
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: vgprs as u16,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+        code: code.to_vec(),
+    })
+}
+
+fn root_raw(root: RootType) -> u32 {
+    match root {
+        RootType::Constants => 0,
+        RootType::Descriptor => 1,
+        RootType::Table => 3,
+        RootType::ImmediateSampler => 4,
+        RootType::ResourceHeap => 5,
+        RootType::SamplerHeap => 6,
+        RootType::Other(n) => n,
+    }
+}
+
+fn kind_raw(kind: ResourceType) -> u8 {
+    match kind {
+        ResourceType::Srv => 0,
+        ResourceType::Sampler => 1,
+        ResourceType::Cbv => 2,
+        ResourceType::Uav => 3,
+        ResourceType::Other(n) => n,
+    }
+}
+
+/// An internal shader container built from the three blocks in a native compute description.
+pub fn console_compute_container(
+    registers: &[u8],
+    table: &[u8],
+    code: &[u8],
+) -> Result<Vec<u8>, ShaderError> {
+    let program = console_compute(registers, table, code)?;
+    compute_container(&program)
+}
+
+/// A container holding `program` (a compute program) as the title's
+/// containers hold theirs, for everything that reads programs from
+/// containers: [`super::native_programs`] gives `program` back.
+fn compute_container(program: &NativeProgram) -> Result<Vec<u8>, ShaderError> {
+    let StageIo::Cs(cs) = &program.io else {
+        return Err(Malformed("not a compute program"));
+    };
+    let put32 =
+        |v: &mut Vec<u8>, at: usize, x: u32| v[at..at + 4].copy_from_slice(&x.to_le_bytes());
+    let put64 =
+        |v: &mut Vec<u8>, at: usize, x: u64| v[at..at + 8].copy_from_slice(&x.to_le_bytes());
+    // payload: slot count and record offsets, the record, its stage data, code, tables
+    let mut payload = vec![0u8; SLOTS.iter().map(|s| s.1).max().unwrap() + 8];
+    put64(&mut payload, 0, GRAPHICS_SLOT_COUNT);
+    for (_, at) in SLOTS {
+        put64(&mut payload, at, ABSENT);
+    }
+    let record = payload.len();
+    put64(
+        &mut payload,
+        super::SLOTS.iter().find(|s| s.0 == HwStage::Cs).unwrap().1,
+        record as u64,
+    );
+    payload.resize(record + RECORD_SIZE as usize + CS_THREADS + 12, 0);
+    let stage = record + RECORD_SIZE as usize;
+    put32(&mut payload, stage + CS_RSRC2, cs.rsrc2);
+    for (k, n) in cs.threads.iter().enumerate() {
+        put32(&mut payload, stage + CS_THREADS + 4 * k, *n);
+    }
+    let code_at = payload.len();
+    payload.extend_from_slice(&program.code);
+    let layout_at = payload.len();
+    for p in &program.layout {
+        let mut e = [0u8; ENTRY_SIZE as usize];
+        e[0..4].copy_from_slice(&root_raw(p.root).to_le_bytes());
+        e[4..8].copy_from_slice(&p.table_offset_dwords.to_le_bytes());
+        e[8..12].copy_from_slice(&p.sgprs.to_le_bytes());
+        e[12..16].copy_from_slice(&p.base_register.to_le_bytes());
+        e[16] = p.user_data;
+        e[17] = p.slot;
+        payload.extend_from_slice(&e);
+    }
+    let used_at = payload.len();
+    for u in &program.used {
+        let mut e = [0u8; ENTRY_SIZE as usize];
+        e[0] = kind_raw(u.kind);
+        e[1] = root_raw(u.root) as u8;
+        e[4..8].copy_from_slice(&u.table_offset_dwords.to_le_bytes());
+        e[8..12].copy_from_slice(&u.lower_bound.to_le_bytes());
+        e[12..16].copy_from_slice(&u.stride.to_le_bytes());
+        e[16] = u.dwords;
+        e[17] = u.user_data;
+        e[18] = u.slot;
+        payload.extend_from_slice(&e);
+    }
+    put64(&mut payload, record, code_at as u64);
+    put64(&mut payload, record + 8, program.code.len() as u64);
+    put32(
+        &mut payload,
+        record + RECORD_FLAGS,
+        if program.wave64 {
+            0
+        } else {
+            super::FLAG_WAVE32
+        },
+    );
+    put64(&mut payload, record + RECORD_LAYOUT, layout_at as u64);
+    put64(&mut payload, record + RECORD_USED, used_at as u64);
+    put32(
+        &mut payload,
+        record + RECORD_COUNTS,
+        program.layout.len() as u32,
+    );
+    put32(
+        &mut payload,
+        record + RECORD_COUNTS + 4,
+        program.used.len() as u32,
+    );
+    put32(&mut payload, record + RECORD_REGS, u32::from(program.vgprs));
+    // FSSM, then XBCH around its zlib stream
+    let mut fssm = b"FSSM".to_vec();
+    fssm.extend(FSSM_VERSION.to_le_bytes());
+    fssm.extend((payload.len() as u64).to_le_bytes());
+    debug_assert_eq!(fssm.len(), FSSM_HEADER);
+    fssm.extend(payload);
+    if fssm.len() as u64 > MAX_UNPACKED {
+        return Err(Malformed(
+            "native compute program exceeds the container size limit",
+        ));
+    }
+    let mut compressed = vec![0; zlib_rs::compress_bound(fssm.len())];
+    let config = zlib_rs::DeflateConfig {
+        level: 0,
+        ..Default::default()
+    };
+    let (stream, status) = zlib_rs::compress_slice(&mut compressed, &fssm, config);
+    if status != zlib_rs::ReturnCode::Ok {
+        return Err(Malformed("could not encode native compute program"));
+    }
+    let mut xbch = b"XBCH".to_vec();
+    xbch.extend(XBCH_VERSION.to_le_bytes());
+    xbch.extend((stream.len() as u64).to_le_bytes());
+    xbch.extend((fssm.len() as u64).to_le_bytes());
+    debug_assert_eq!(xbch.len(), XBCH_HEADER);
+    xbch.extend_from_slice(stream);
+    // the DXIL part: a header up to the index, the index of one entry, the blob
+    let mut dxil = vec![0u8; XDAT_OFFSET];
+    dxil.extend_from_slice(b"XDAT");
+    dxil.extend(1u32.to_le_bytes());
+    dxil.extend(0x24u32.to_le_bytes());
+    let blob_at = dxil.len() + 12;
+    dxil.extend(KIND_NATIVE.to_le_bytes());
+    dxil.extend((blob_at as u32).to_le_bytes());
+    dxil.extend((xbch.len() as u32).to_le_bytes());
+    dxil.extend(xbch);
+    Ok(dxbc::build(&[(FourCC::DXIL, &dxil)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A synthetic table with a fixed
+    /// sampler and a table of an SRV, two UAVs and a CBV, then a range and
+    /// the hash.
+    fn table() -> Vec<u8> {
+        let mut t = Vec::new();
+        for w in [0x403u32, 0, 0, 0, 0, 5 << 16] {
+            t.extend(w.to_le_bytes());
+        }
+        let mut entry = |words: [u32; 8]| {
+            for w in words {
+                t.extend(w.to_le_bytes());
+            }
+        };
+        entry([0x41, 0x401, 0, 3, 0, 0x0002_0004, u32::MAX, 0]);
+        entry([0x41, 0x300, 0, 9, 4, 0x408, u32::MAX, 0]);
+        entry([0x41, 0x303, 8, 2, 4, 0x408, u32::MAX, 0]);
+        entry([0x41, 0x303, 16, 3, 4, 0x408, u32::MAX, 0]);
+        entry([0x41, 0x302, 24, 1, 0, 0x404, u32::MAX, 0]);
+        entry([0x42, 0, 0, 9, 1, 0, u32::MAX, 0]);
+        entry([0x43, 1, 2, 3, 4, 0, 0, 0]);
+        let size = (t.len() - 0x14) as u32;
+        t[4..8].copy_from_slice(&size.to_le_bytes());
+        t
+    }
+
+    fn registers() -> Vec<u8> {
+        [0u32, 0, 0, 8 << 16 | 8, 1, 3, 5 << 1]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn a_console_compute_program_reads_its_registers_and_table() {
+        let code = [0x7E00_0280u32, 0xBF81_0000, S_CODE_END, S_CODE_END];
+        let code: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = console_compute(&registers(), &table(), &code).unwrap();
+        assert!(p.wave64);
+        assert_eq!(p.vgprs, 16);
+        assert_eq!(p.code.len(), 8, "the s_code_end padding is left out");
+        let StageIo::Cs(cs) = p.io else { panic!() };
+        assert_eq!(
+            (cs.rsrc2, cs.threads, cs.user_sgprs()),
+            (5 << 1, [8, 8, 1], 5)
+        );
+        assert_eq!(p.used.len(), 5);
+        assert_eq!(
+            p.used[2],
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 2,
+                stride: 4,
+                dwords: 8,
+                user_data: 4,
+                slot: 0,
+            }
+        );
+        assert_eq!(
+            (p.used[0].kind, p.used[0].root, p.used[0].slot),
+            (ResourceType::Sampler, RootType::ImmediateSampler, 2)
+        );
+        assert_eq!(p.layout[4].table_offset_dwords, 24);
+    }
+
+    #[test]
+    fn incomplete_or_unknown_descriptions_are_refused() {
+        let t = table();
+        let code = 0xBF81_0000u32.to_le_bytes();
+        let regs = registers();
+        for end in 0..t.len() {
+            assert!(console_compute(&regs, &t[..end], &code).is_err());
+        }
+        for (offset, value) in [(20, 20u32 << 16), (24, 0x44), (t.len() - 32, 0x42)] {
+            let mut bad = t.clone();
+            bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(console_compute(&regs, &bad, &code).is_err());
+        }
+        assert!(console_compute(&regs, &t, &code[..3]).is_err());
+        assert!(console_compute(&regs, &t, &S_CODE_END.to_le_bytes()).is_err());
+        let mut large = regs;
+        large[12..16].copy_from_slice(&(64u32 << 16 | 32).to_le_bytes());
+        assert!(console_compute(&large, &t, &code).is_err());
+    }
+
+    #[test]
+    fn short_header_wave32_and_multiblock_code_round_trip() {
+        let mut t = table();
+        t.drain(8..16);
+        t[..4].copy_from_slice(&3u32.to_le_bytes());
+        let mut regs = registers();
+        regs[..4].copy_from_slice(&super::super::FLAG_WAVE32.to_le_bytes());
+        let code = vec![0; 65536];
+        let p = console_compute(&regs, &t, &code).unwrap();
+        assert!(!p.wave64);
+        assert_eq!(p.vgprs, 32);
+        let bytes = console_compute_container(&regs, &t, &code).unwrap();
+        let c = crate::Container::parse(&bytes).unwrap();
+        assert_eq!(
+            super::super::native_programs(c.part(FourCC::DXIL).unwrap().data).unwrap(),
+            vec![p]
+        );
+    }
+
+    #[test]
+    fn its_container_gives_the_program_back() {
+        let code: Vec<u8> = [0x7E00_0280u32, 0xBF81_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = console_compute(&registers(), &table(), &code).unwrap();
+        let container = compute_container(&p).unwrap();
+        let c = crate::Container::parse(&container).unwrap();
+        let back = super::super::native_programs(c.part(FourCC::DXIL).unwrap().data).unwrap();
+        assert_eq!(back, vec![p]);
+    }
+}

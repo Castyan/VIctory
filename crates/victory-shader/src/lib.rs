@@ -98,6 +98,9 @@ mod source_tests {
     // remaining modules are only compiled by the Windows execution tests.
     const OUTSIDE_TRANSLATION: &[&str] = &[
         "emit/cube_lod_tests.rs",
+        // (programs the title hands over compiled, wrapped in a container that the
+        // translation then reads as any other)
+        "native_build.rs",
         "emit/descriptor_tests.rs",
         "emit/diff_tests.rs",
         "emit/helper_lane_tests.rs",

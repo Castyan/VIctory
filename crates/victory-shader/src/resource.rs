@@ -2264,7 +2264,7 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        self.spilled(inst.read(Reg::V(reg))?, constant_operand(lane)?, &mut Vec::new())
             .ok()
             .flatten()
     }
@@ -2298,7 +2298,7 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
+        if constant_operand(*at).ok_or(())? != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
@@ -2314,8 +2314,8 @@ impl Tracer<'_> {
     }
 }
 
-/// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
+/// An inline or literal constant operand.
+fn constant_operand(op: Operand) -> Option<u32> {
     match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
@@ -2331,16 +2331,21 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    if inst.name() == "s_bfm_b32" && k == 0 {
+        let [width, shift] = src.as_slice() else { return None };
+        let width = constant_operand(*width)? & 31;
+        let shift = constant_operand(*shift)? & 31;
+        return Some(Moved::Const(((1u32 << width) - 1) << shift));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
             inst.read(Reg::S(code + k as u8)).map(Moved::Value)
         }
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { .. }) => Some(Moved::Const(0)),
-        ("s_mov_b32", Operand::Literal(x)) => Some(Moved::Const(x)),
+        // A literal used by a 64-bit bitwise instruction is zero extended.
+        ("s_mov_b32" | "s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         ("s_mov_b32", Operand::Const(c)) => inline(c).map(Moved::Const),
-        // shortcut: only the one-operand ways the compiler makes a constant
-        // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
         // 64-bit inline integers are sign-extended.
@@ -2451,6 +2456,25 @@ pub(crate) mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_constant_bitmask_can_supply_a_static_sampler_word() {
+        let r = track_words(
+            &[
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001, 0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0xBE88_0480, // s_mov_b64 s[8:9], 0
+                0xBE8A_04FF, 0x8000_0001, // s_mov_b64 s[10:11], literal
+                0x9209_8385, // s_bfm_b32 s9, 5, 3
+                0xF080_0F08, 0x0040_0002, // image_sample using s[8:11] as its sampler
+                S_ENDPGM,
+            ],
+            &[param(Table, 2, 1)],
+            HwStage::Ps,
+        );
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
+        assert_eq!(sampler.source, Source::Constant(vec![0, 0xf8, 0x8000_0001, 0]));
     }
 
     #[test]

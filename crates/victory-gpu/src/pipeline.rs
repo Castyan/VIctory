@@ -668,6 +668,88 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// Device method 0x218: a compute pipeline from a program the title has
+/// compiled already and put in its own memory. `desc` is a record of 0x60
+/// bytes: the root signature, then (address, size) pairs of the program's
+/// registers (0x1c bytes), of a second register block, of its code and of
+/// its resource table, two addresses and the program's 64-bit hash. The
+/// title makes one for every variant of its small compute programs (mip
+/// generation of texture arrays) at start.
+///
+/// The code is not that of the title's container of the same program: it is
+/// compiled again, for a root signature whose table can hold more ranges.
+/// So the program is read from the record
+/// ([`victory_shader::native::console_compute_container`]) and put in a container of
+/// its own, which is translated and cached as the title's containers are.
+pub(crate) extern "system" fn create_native_compute(
+    _: This,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { *out = std::ptr::null() };
+    }
+    let program = (|| {
+        let registers = title_bytes(desc, 1)?;
+        let code = title_bytes(desc, 5)?;
+        let table = title_bytes(desc, 7)?;
+        victory_shader::native::console_compute_container(&registers, &table, &code)
+            .map_err(|e| tracing::debug!(error = %e, "a compute program compiled by the title is not read"))
+            .ok()
+    })();
+    let made = MADE[usize::from(program.is_none())].fetch_add(1, Ordering::Relaxed) + 1;
+    let Some(container) = program else {
+        if made.is_power_of_two() {
+            tracing::warn!(missed = made, "a compute pipeline from compiled code that is not read: the title goes without it");
+        }
+        return crate::object::E_NOTIMPL;
+    };
+    let shader = shader("compute", &container);
+    if made.is_power_of_two() {
+        tracing::info!(made, hash = %shader.hash, "native compute descriptions decoded");
+    }
+    hand_out(
+        vec![shader],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
+/// The bytes named by words `at` (address) and `at + 1` (size) of the
+/// title's description `desc`, read through the kernel: the title's own
+/// memory, which may not be mapped.
+fn title_bytes(desc: *const u8, at: usize) -> Option<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        let mut words = [0u8; 16];
+        if desc.is_null() {
+            return None;
+        }
+        let start = desc.wrapping_add(8 * at);
+        if !crate::host::read_into(start, &mut words) {
+            return None;
+        }
+        let address = u64::from_le_bytes(words[..8].try_into().ok()?) as usize;
+        let size = u64::from_le_bytes(words[8..].try_into().ok()?) as usize;
+        if address == 0 || !(4..=1 << 20).contains(&size) {
+            return None;
+        }
+        let mut bytes = vec![0u8; size];
+        crate::host::read_into(address as *const u8, &mut bytes).then_some(bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (desc, at);
+        None
+    }
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -843,6 +925,38 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_compute_slot_reads_the_description_and_clears_failed_outputs() {
+        type Create = extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT;
+        let device = crate::device::device();
+        let create = slot::<Create>(device, 0x218);
+        let regs = [0u32, 0, 0, 1 << 16 | 1, 1, 0, 0];
+        let code = [0xBF81_0000u32];
+        // Short table header and a terminal hash entry, with no resources.
+        let mut table = [0u32; 12];
+        table[1] = 36;
+        table[4] = 0x43;
+        let mut desc = [0usize; 12];
+        for (at, words) in [(1, regs.as_slice()), (5, &code[..]), (7, &table[..])] {
+            desc[at] = words.as_ptr() as usize;
+            desc[at + 1] = size_of_val(words);
+        }
+        let mut out = std::ptr::null();
+        assert_eq!(create(device, desc.as_ptr().cast(), &PIPELINE_IIDS[0], &mut out), S_OK);
+        let shaders = shaders(out);
+        assert_eq!(shaders.len(), 1);
+        assert_eq!(shaders[0].0, "compute");
+        let c = victory_shader::Container::parse(&shaders[0].1).unwrap();
+        let programs = victory_shader::native_programs(c.part(victory_shader::FourCC::DXIL).unwrap().data).unwrap();
+        assert_eq!(programs[0].code, code[0].to_le_bytes());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(out, 0x10)(out), 0);
+
+        desc[6] = 0;
+        assert_eq!(create(device, desc.as_ptr().cast(), &PIPELINE_IIDS[0], &mut out), crate::object::E_NOTIMPL);
+        assert!(out.is_null());
     }
 
     #[test]
