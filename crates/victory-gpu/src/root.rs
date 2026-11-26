@@ -195,6 +195,22 @@ pub(crate) extern "system" fn create(
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
 
+/// The serialized form of the root signature `this`, if it is one of ours
+/// (device method 0x218 names the program's root signature by pointer).
+#[cfg(windows)]
+pub(crate) fn blob_of(this: This) -> Option<Vec<u8>> {
+    let mut head = [0u8; 8];
+    if this.is_null() || !crate::host::read_into(this.cast(), &mut head) {
+        return None;
+    }
+    if usize::from_le_bytes(head) != FUNCTIONS.0.as_ptr() as usize {
+        return None;
+    }
+    // SAFETY: an object with this table is a `RootSignature` of ours, which
+    // the title holds while it passes it.
+    Some(unsafe { &*this.cast::<RootSignature>() }.blob.clone())
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &ROOT_SIGNATURE_IIDS).then_some(this);
     object::answer(ROOT_SIGNATURE, iid, found, out)
@@ -255,6 +271,13 @@ mod tests {
             create(null, 0, data, size, &ROOT_SIGNATURE_IIDS[0], &mut root),
             S_OK
         );
+        // What a 0x218 description names: the blob back, and nothing for
+        // another object or no object.
+        // SAFETY: the blob's `size` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data, size) };
+        assert_eq!(blob_of(root).as_deref(), Some(bytes));
+        assert_eq!(blob_of(blob), None);
+        assert_eq!(blob_of(null), None);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
     }
