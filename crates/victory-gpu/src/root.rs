@@ -301,8 +301,10 @@ mod tests {
             rooted(&registers),
             victory_shader::native::console_compute_container(&registers, &table, &code)
         );
+        // A user SGPR past the parameters is left unnamed, not refused (the
+        // translator refuses a program that reads it).
         registers[0x18..0x1c].copy_from_slice(&(6u32 << 1).to_le_bytes());
-        assert!(rooted(&registers).is_err());
+        assert!(rooted(&registers).is_ok());
         assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
     }

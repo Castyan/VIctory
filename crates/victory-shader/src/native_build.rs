@@ -225,10 +225,13 @@ fn root_signature(blob: &[u8]) -> Result<(Vec<SerializedParam>, u32), ShaderErro
 /// in order, a table taking one dword, root constants their count, a root
 /// CBV two (slot 0 at 4 even when unnamed, a root CBV at 7 taking 7 and 8,
 /// the constants after it at 9), so the others are placed the same way.
-/// Nothing is guessed: the program is refused when the table places a
-/// parameter elsewhere, when a parameter is cut by the end of the
-/// program's user SGPRs, and when user SGPRs are left past the parameters
-/// (where a directly indexed heap would be, which no capture places).
+/// 200 descriptions captured in game with their signatures agree: 196 end
+/// their parameters exactly at their user-SGPR count. Nothing is guessed:
+/// the program is refused when the table places a parameter elsewhere or
+/// a parameter is cut by the end of the program's user SGPRs, and user
+/// SGPRs left past the parameters stay unnamed (the 4 such captures, with
+/// a directly indexed heap, never read theirs; one that does is refused by
+/// the translator).
 fn completed(
     layout: &[RootParam],
     params: &[SerializedParam],
@@ -286,13 +289,12 @@ fn completed(
             slot: k as u8,
         });
     }
-    if end < user_sgprs {
-        return Err(Malformed(if flags & HEAPS_INDEXED != 0 {
-            "user SGPRs past the root parameters, where a directly indexed heap would be: no capture places it"
-        } else {
-            "user SGPRs past the root parameters"
-        }));
-    }
+    // User SGPRs past the parameters are left unnamed. Of 200 descriptions
+    // captured in game, 196 have none, and the 4 with one more have a
+    // directly indexed heap in their signature but never read that SGPR.
+    // A program that reads one is still refused by the translator ("a
+    // hardware SGPR input"): nothing is placed there by guess.
+    let _ = (end, flags & HEAPS_INDEXED);
     Ok(out)
 }
 
@@ -819,13 +821,11 @@ mod tests {
             Err(Malformed(why)) => why,
             r => panic!("{r:?}"),
         };
-        // A user SGPR past the parameters: a heap, whose place is not guessed.
+        // A user SGPR past the parameters (where a directly indexed heap
+        // would be) is left unnamed: nothing is placed there.
         let (_, heaps) = root_signature(&rts0(&params, 0x400)).unwrap();
-        assert!(refused(completed(&named(), &four, heaps, 11)).contains("directly indexed heap"));
-        assert_eq!(
-            refused(completed(&named(), &four, 0, 11)),
-            "user SGPRs past the root parameters"
-        );
+        assert_eq!(completed(&named(), &four, heaps, 11).unwrap(), layout);
+        assert_eq!(completed(&named(), &four, 0, 11).unwrap(), layout);
         // Constants cut by the end of the user SGPRs.
         assert!(refused(completed(&named(), &four, 0, 8)).contains("cut by the end"));
         // A table that places a parameter elsewhere, or names another type.
