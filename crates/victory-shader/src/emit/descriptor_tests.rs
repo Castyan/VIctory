@@ -242,3 +242,31 @@ fn a_sampler_each_arm_of_a_uniform_branch_sets_samples_as_that_arm_says() {
         }
     }
 }
+
+#[test]
+fn an_immediate_sampler_made_with_a_64_bit_bitmask_samples_as_its_words_say() {
+    // The 0x218 programs' sampler: `s_bfm_b64 s[44:45], 2, 54` (dword 1 = 3 << 22, levels up to
+    // 12) and `s_mov_b64 s[46:47], 0x18500000` (linear filters and mips), wrapping (dword 0 =
+    // 0). At u = 1.0 of a 2 x 1 texture the sample is halfway between texel 1 (red 2.0) and,
+    // wrapped, texel 0 (red 1.0): 1.5. Point filtering would give 1.0, clamping 2.0.
+    let shader = translate(&native(&[
+        0x9294_B682, // s_bfm_b64 s[20:21], 2, 54
+        0xBE96_04FF,
+        0x1850_0000, // s_mov_b64 s[22:23], 0x18500000
+        0x7E02_02FF,
+        0x3F80_0000, // v_mov_b32 v1, 1.0
+        0x7E04_02FF,
+        0x3F00_0000, // v_mov_b32 v2, 0.5
+        0xF09C_0F08,
+        0x00A2_0301, // image_sample_lz v[3:6], v[1:2], s[8:15], s[20:23] dmask:0xf 2D
+        0xE070_0000,
+        0x8004_0300, // buffer_store_dword v3, off, s[16:19], 0
+    ]));
+    assert_eq!(shader.static_samplers.len(), 1);
+    let s = shader.static_samplers[0];
+    assert_eq!((s.filter, s.address, s.max_lod), (0x15, [1, 1, 1], 12.0));
+    let texels = [[1.0f32, 0.0, 0.0, 1.0], [2.0, 0.0, 0.0, 1.0]];
+    for (label, words) in run(&shader, 0, View::Texture(2, 1, &texels)) {
+        assert_eq!(f32::from_bits(words[0]), 1.5, "{label}");
+    }
+}
