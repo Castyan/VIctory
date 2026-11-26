@@ -5779,6 +5779,13 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 (self.s.m.bin(c, Bin::Xor, a, ones), None)
             }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                // The low byte or word, sign-extended (SCC is left alone).
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name == "s_sext_i32_i8" { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, t, k), None)
+            }
             "s_add_u32" | "s_add_i32" | "s_addk_i32" => {
                 let a = src32(self, 0)?;
                 let b = if name == "s_addk_i32" {
