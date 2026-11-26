@@ -2345,6 +2345,12 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
+        #[cfg(feature = "diagnostics")]
+        let trace = crate::pipeline::dispatch_trace(self.pipeline as This);
+        #[cfg(feature = "diagnostics")]
+        if let Some(trace) = trace {
+            trace.attempt(false);
+        }
         // It may write the arguments a window holds clamped.
         self.window = None;
         let builder = crate::pipeline::is_builder(self.pipeline as This);
@@ -2449,6 +2455,10 @@ impl State {
                 set_tail(0);
                 unsafe { list.list.Dispatch(x, y, z) };
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(trace) = trace {
+            trace.record(false);
         }
         if let Some((param, word, _)) = tail {
             // Later ordinary or indirect dispatches use all lanes.
@@ -3378,7 +3388,19 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let trace = (kind == 2 && max != 0)
+            .then(|| crate::pipeline::dispatch_trace(self.pipeline as This))
+            .flatten();
+        #[cfg(feature = "diagnostics")]
+        if let Some(trace) = trace {
+            trace.attempt(true);
+        }
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        #[cfg(feature = "diagnostics")]
+        if ran && let Some(trace) = trace {
+            trace.record(true);
+        }
         if kind == 2 && max != 0 && crate::pipeline::is_builder(self.pipeline as This) {
             if !ran {
                 crate::pipeline::builder_off("an indirect builder dispatch could not run");

@@ -521,6 +521,8 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
+    #[cfg(feature = "diagnostics")]
+    crate::pipeline::report_dispatch_traces(crate::queue::presented());
     let mut text = what.to_string();
     if let Some(host) = host() {
         // SAFETY: a plain query.
