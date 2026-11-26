@@ -29,9 +29,11 @@
 //! for buffer SRVs (a structured stride), which no user-SGPR count covers.
 //!
 //! Root type 0 is root constants (resource type 2): the program reads them
-//! as values straight from its user SGPRs (`v_mul_f32 v7, s5, v7`), so the
-//! descriptor dwords byte is their size in bytes. They give a root parameter
-//! and no used resource, as nothing is loaded through them.
+//! as values straight from its user SGPRs (`v_mul_f32 v7, s5, v7`). They
+//! give a root parameter and no used resource, as nothing is loaded through
+//! them. Their descriptor dwords byte is 4 whatever their count (1 to 4 in
+//! the root signatures captured with them), so the table alone gives the
+//! first one only; their count comes from the root signature.
 //!
 //! Root type 1 is a root descriptor, a 64-bit buffer address in two user
 //! SGPRs (descriptor dwords 2). Seen as an SRV (`t1`, user data 7 and 8,
@@ -95,14 +97,14 @@ fn resources(table: &[u8]) -> Result<(Vec<RootParam>, Vec<UsedResource>), Shader
         let slot = u8::try_from(packed >> 16).map_err(|_| Malformed("implausible root slot"))?;
         let user_data = (packed >> 8) as u8;
         if root == RootType::Constants {
-            let bytes = packed & 0xFF;
-            if bytes == 0 || !bytes.is_multiple_of(4) {
-                return Err(Malformed("implausible root constants size"));
+            if packed & 0xFF != 4 {
+                return Err(Malformed("implausible root constants entry"));
             }
+            // The first constant: the count is the root signature's.
             layout.push(RootParam {
                 root,
                 table_offset_dwords: 0,
-                sgprs: bytes / 4,
+                sgprs: 1,
                 base_register: register,
                 user_data,
                 slot,
@@ -265,6 +267,17 @@ fn completed(
         ));
     }
     let mut out = layout.to_vec();
+    // Root constants the table names: it gives the first only, the
+    // signature their count.
+    for l in out.iter_mut().filter(|l| l.root == RootType::Constants) {
+        let p = &params[usize::from(l.slot)];
+        if u32::from(l.user_data) + p.dwords > user_sgprs {
+            return Err(Malformed(
+                "a root parameter cut by the end of the program's user SGPRs",
+            ));
+        }
+        l.sgprs = p.dwords;
+    }
     for (k, p) in params.iter().enumerate() {
         let (first, past) = (at[k], at[k] + p.dwords);
         if named(k) || first >= user_sgprs {
@@ -837,6 +850,27 @@ mod tests {
         // Root UAVs, which no table places, and short blobs.
         assert!(root_signature(&rts0(&[(4, [0; 3])], 0)).is_err());
         assert!(root_signature(&rts0(&params, 0)[..20]).is_err());
+    }
+
+    /// As the title's `slot218-m084`: the table names root constants in
+    /// dword 6 with its usual byte 4, the signature gives three of them.
+    #[test]
+    fn root_constants_take_their_count_from_the_signature() {
+        let p = |root, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let table = vec![p(RootType::Table, 4, 0), p(RootType::Table, 5, 1), p(RootType::Constants, 6, 2)];
+        let (sig, flags) =
+            root_signature(&rts0(&[(0, [0; 3]), (0, [0; 3]), (1, [0x1f6, 0, 3])], 0)).unwrap();
+        let layout = completed(&table, &sig, flags, 9).unwrap();
+        assert_eq!(layout[2].sgprs, 3);
+        // Three constants from dword 6 do not fit in eight user SGPRs.
+        assert!(completed(&table, &sig, flags, 8).is_err());
     }
 
     /// A root SRV is taken where the table places it itself (as the title's
