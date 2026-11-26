@@ -153,6 +153,13 @@ fn inline_f16(c: u8) -> u32 {
     ][usize::from(c - 240)]
 }
 
+/// Whether `inst` is an unsigned 32-bit addition or subtraction whose clamp bit saturates it
+/// (`Lower::integer` does), without SDWA or DPP around it.
+fn saturates(inst: &Inst) -> bool {
+    matches!(&inst.fields, Fields::Valu(v) if v.clamp && v.sdwa.is_none() && v.dpp.is_none())
+        && matches!(inst.name(), "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
     Unorm,
@@ -4322,7 +4329,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        if v.clamp && !saturates(inst) || v.omod != 0 {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -8707,7 +8714,19 @@ impl<'a> Lower<'a> {
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
-                self.s.m.bin(c, op, a, b)
+                let r = self.s.m.bin(c, op, a, b);
+                if !saturates(inst) {
+                    return Ok(r);
+                }
+                // clamp: the unsigned result saturates, at 2^32 - 1 past the top
+                // and at 0 below it
+                let (out, at) = if op == Bin::Add {
+                    (self.s.m.cmp(c, pred::IULT, r, a), u32::MAX)
+                } else {
+                    (self.s.m.cmp(c, pred::IULT, a, b), 0)
+                };
+                let at = k(self, at);
+                self.s.m.select(c, out, at, r)
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);

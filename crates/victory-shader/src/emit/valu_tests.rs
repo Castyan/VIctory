@@ -2421,3 +2421,33 @@ fn packed_fmac_f16_rounds_the_fused_sum_once() {
         }
     });
 }
+
+/// `v_add_nc_u32`, `v_sub_nc_u32` and `v_subrev_nc_u32` with clamp (VOP3 0x125-0x127), as
+/// `slot218-m185` at 0x13c (`v_sub_nc_u32 v9, v9, v5 clamp`): the unsigned result saturates
+/// at 2^32 - 1 and 0; without clamp it wraps.
+#[test]
+fn clamped_unsigned_add_and_sub_saturate() {
+    let edges = [0, 1, 2, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0xFFFF_FFFF, 0x1234_5678];
+    let cases: Vec<[u32; 4]> = edges.iter().flat_map(|&a| edges.iter().map(move |&b| [a, b, 0, 0])).collect();
+    for (op, f) in [
+        (0x125, (|a: u32, b: u32| a.saturating_add(b)) as fn(u32, u32) -> u32),
+        (0x126, |a, b| a.saturating_sub(b)),
+        (0x127, |a, b| b.saturating_sub(a)),
+    ] {
+        for clamp in [true, false] {
+            let shader = build_valu_cs(&vop3_mod(op, 0, vgpr(1), vgpr(2), 0, 0, 0, 0, clamp));
+            run_cases(&shader, &cases, |backend, _, i, got| {
+                let want = if clamp {
+                    f(i[0], i[1])
+                } else {
+                    match op {
+                        0x125 => i[0].wrapping_add(i[1]),
+                        0x126 => i[0].wrapping_sub(i[1]),
+                        _ => i[1].wrapping_sub(i[0]),
+                    }
+                };
+                assert_eq!(got, want, "{backend}: op {op:#x} clamp {clamp} of {:#x}, {:#x}", i[0], i[1]);
+            });
+        }
+    }
+}
