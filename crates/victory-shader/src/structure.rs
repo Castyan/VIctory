@@ -975,13 +975,14 @@ impl<'a> Lanes<'a> {
 
     /// The dword SSA value `v` holds, where the instruction writing it (through scalar moves)
     /// computes it from constant operands alone: `s_mov_b32` of an integer inline constant or
-    /// a literal, `s_mov_b64` of an integer inline constant (sign-extended), and `s_bfm_b64`
-    /// and `s_bitreplicate_b64_b32` of such 32-bit operands. None for anything else (a join,
-    /// a program input, a float inline constant, a 64-bit literal).
+    /// a literal, `s_movk_i32`, `s_brev_b32` and `s_pack_*_b32_b16` of such operands,
+    /// `s_mov_b64` of an integer inline constant (sign-extended), and `s_bfm_b64` and
+    /// `s_bitreplicate_b64_b32` of such 32-bit operands. None for anything else (a join, a
+    /// program input, a float inline constant, a 64-bit literal).
     fn constant_word(&self, v: Value, depth: u32) -> Option<u32> {
         let &(b, i) = self.defs.get(&v)?;
         let inst = &self.p.blocks[b].insts[i];
-        let Fields::Sop { dst: Some(Operand::Scalar { code: dst, .. }), src, .. } = &inst.fields else {
+        let Fields::Sop { dst: Some(Operand::Scalar { code: dst, .. }), src, imm } = &inst.fields else {
             return None;
         };
         let half = inst.writes.iter().find(|w| w.1 == v).and_then(|w| match w.0 {
@@ -999,6 +1000,13 @@ impl<'a> Lanes<'a> {
                 return self.constant_word(inst.read(Reg::S(*code))?, depth + 1);
             }
             ("s_mov_b32", [op]) if half == 0 => return word(op),
+            // the 16-bit immediate, sign-extended
+            ("s_movk_i32", []) if half == 0 => return imm.map(|k| k as i16 as u32),
+            ("s_brev_b32", [a]) if half == 0 => return word(a).map(u32::reverse_bits),
+            // a half of each operand, the first's in the low half
+            ("s_pack_ll_b32_b16", [a, b]) if half == 0 => return Some(word(a)? & 0xFFFF | word(b)? << 16),
+            ("s_pack_lh_b32_b16", [a, b]) if half == 0 => return Some(word(a)? & 0xFFFF | word(b)? & 0xFFFF_0000),
+            ("s_pack_hh_b32_b16", [a, b]) if half == 0 => return Some(word(a)? >> 16 | word(b)? & 0xFFFF_0000),
             ("s_mov_b64", [Operand::Scalar { code, .. }]) if *code != NULL && depth < 16 => {
                 return self.constant_word(inst.read(Reg::S(code + half))?, depth + 1);
             }
