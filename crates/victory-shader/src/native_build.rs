@@ -35,7 +35,12 @@
 //!
 //! The registers of a compute program, 0x1c bytes: u32 flags (bit 5: 32
 //! lanes, as the container record's flags), u32, u32, u16 x3 thread-group
-//! size and u16 not read, u32 `COMPUTE_PGM_RSRC1`, u32 `COMPUTE_PGM_RSRC2`.
+//! size and u16 whose bit 4 is set for a program of 32 lanes, u32
+//! `COMPUTE_PGM_RSRC1`, u32 `COMPUTE_PGM_RSRC2`. The flags' bit 5 is clear
+//! in every 0x218 program seen; the programs with that u16 at 0x10 move
+//! `exec_lo` alone, keep scalars in `vcc_hi` and use VGPRs up to the 32-lane
+//! count of `COMPUTE_PGM_RSRC1` (v143 of 18 granules), and the others move
+//! the whole `exec` and stay within the 64-lane count.
 
 use super::{
     ABSENT, CS_RSRC2, CS_THREADS, ComputeIo, ENTRY_SIZE, MAX_UNPACKED, FSSM_HEADER, FSSM_VERSION, GRAPHICS_SLOT_COUNT, HwStage,
@@ -48,6 +53,9 @@ use crate::dxbc::u32_at;
 use crate::{FourCC, dxbc};
 
 const S_CODE_END: u32 = 0xBF9F_0000;
+
+/// In the registers' depth word, above the depth: a program of 32 lanes.
+const WAVE32_DEPTH_BIT: u32 = 0x10 << 16;
 
 /// The descriptors a console resource table names, and the root parameters
 /// they come through (one per table range, and one per fixed sampler).
@@ -151,9 +159,9 @@ fn console_compute(
     }
     let flags = u32_at(registers, 0)?;
     let size = u32_at(registers, 0x0c)?;
-    // The depth is the low half of its word; the high half holds something
-    // else (0x10 seen with 32 x 1 x 1 groups).
-    let threads = [size & 0xFFFF, size >> 16, u32_at(registers, 0x10)? & 0xFFFF];
+    // The depth is the low half of its word; the high half says 32 lanes.
+    let depth = u32_at(registers, 0x10)?;
+    let threads = [size & 0xFFFF, size >> 16, depth & 0xFFFF];
     let rsrc1 = u32_at(registers, 0x14)?;
     let rsrc2 = u32_at(registers, 0x18)?;
     if threads.contains(&0)
@@ -165,7 +173,7 @@ fn console_compute(
     {
         return Err(Malformed("implausible thread-group size"));
     }
-    let wave64 = flags & super::FLAG_WAVE32 == 0;
+    let wave64 = flags & super::FLAG_WAVE32 == 0 && depth & WAVE32_DEPTH_BIT == 0;
     // COMPUTE_PGM_RSRC1.VGPRS: granules of 4 (64 lanes) or 8 (32 lanes), less one.
     let vgprs = ((rsrc1 & 0x3F) + 1) * if wave64 { 4 } else { 8 };
     if vgprs > 256 || !code.len().is_multiple_of(4) {
@@ -464,7 +472,7 @@ mod tests {
 
     /// A title's gamma pass: a UAV table in dword 4 and one root constant
     /// in dword 5, read as a value; and a depth word whose high half is not
-    /// the depth.
+    /// the depth but says 32 lanes.
     #[test]
     fn root_constants_are_a_root_parameter_and_the_depth_its_low_half() {
         let mut t = Vec::new();
@@ -486,6 +494,9 @@ mod tests {
         let p = console_compute(&regs, &t, &code).unwrap();
         let StageIo::Cs(cs) = p.io else { panic!() };
         assert_eq!(cs.threads, [32, 1, 1]);
+        // 0x10 above the depth: 32 lanes, VGPRs in granules of 8.
+        assert!(!p.wave64);
+        assert_eq!(p.vgprs, 32);
         assert_eq!(p.used.len(), 1, "constants are not a resource read");
         assert_eq!(
             p.layout[1],
