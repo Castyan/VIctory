@@ -375,6 +375,38 @@ fn src_scc_reads_the_scc_bit_as_a_number() {
     }
 }
 
+/// The scalar packs, `s_bfm_b64` and `s_bitreplicate_b64_b32`, as the
+/// 0x218 programs use them, on s0 and s1; each 64-bit result is read back
+/// a half at a time.
+#[test]
+fn scalar_packs_and_64_bit_fields_are_the_consoles() {
+    // SOP1 `op sdst, src0`.
+    const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+        0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
+    }
+    let replicate = |x: u32| (0..64).fold(0u64, |r, i| r | u64::from(x >> (i / 2) & 1) << i);
+    let field = |a: u32, b: u32| ((1u64 << (a & 63)).wrapping_sub(1)) << (b & 63);
+    type Case = (Vec<u32>, Box<dyn Fn(u32, u32) -> u32>);
+    let cases: Vec<Case> = vec![
+        (vec![sop2(0x32, 6, 0, 1)], Box::new(|a, b| (b & 0xFFFF) << 16 | a & 0xFFFF)),
+        (vec![sop2(0x33, 6, 0, 1)], Box::new(|a, b| b & 0xFFFF_0000 | a & 0xFFFF)),
+        (vec![sop2(0x34, 6, 0, 1)], Box::new(|a, b| b & 0xFFFF_0000 | a >> 16)),
+        (vec![sop2(0x25, 6, 0, 1)], Box::new(move |a, b| field(a, b) as u32)),
+        (vec![sop2(0x25, 6, 0, 1), s_mov_b32(6, 7)], Box::new(move |a, b| (field(a, b) >> 32) as u32)),
+        (vec![sop1(0x3b, 6, 0)], Box::new(move |a, _| replicate(a) as u32)),
+        (vec![sop1(0x3b, 6, 0), s_mov_b32(6, 7)], Box::new(move |a, _| (replicate(a) >> 32) as u32)),
+    ];
+    let inputs = [[0x1234_5678, 0x9ABC_DEF0, 0, 0], [5, 3, 0, 0], [40, 20, 0, 0], [0x8000_0001, 63, 0, 0]];
+    for (body, expected) in cases {
+        let mut words = body.clone();
+        words.push(vop1(0x001, 0, sgpr(6))); // v_mov_b32 v0, s6
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &inputs, |backend, _, i, got| {
+            assert_eq!(got, expected(i[0], i[1]), "{backend}: {body:08x?} with {i:x?}");
+        });
+    }
+}
+
 #[test]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
