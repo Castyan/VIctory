@@ -962,15 +962,11 @@ fn paired(
             what: "paired lanes outside compute",
         });
     };
-    // The ray-tracing structure builder's programs (a spilled user-data table, as
-    // `victory-gpu` tells them) exchange across the halves, and forcing them onto 32-lane
-    // hosts hung NVIDIA cards (Marvisak/VIctory#2711): they stay refused.
-    if crate::spill::is_spilled(native) {
-        return Err(ShaderError::Unsupported {
-            offset: 0,
-            what: "paired lanes for the ray-tracing structure builder",
-        });
-    }
+    // The ray-tracing structure builder's programs (a spilled user-data table) exchange
+    // across the halves. The per-half form got that wrong and hung NVIDIA cards
+    // (Marvisak/VIctory#2711); the paired form keeps both halves in one host wave, as the
+    // console does. The builder still runs only when `victory-gpu` allows it
+    // (`VICTORY_BVH_BUILDER=1`) and every one of its pipelines exists.
     if cs.threads.iter().product::<u32>() % 64 != 0 {
         return Err(ShaderError::Unsupported {
             offset: 0,
