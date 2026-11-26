@@ -352,6 +352,29 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
+/// `src_scc` (operand 253) reads the SCC bit as 0 or 1, as the 0x218
+/// programs read it: `s_mov_b32 sN, src_scc`, `s_add_u32 sN, sM, src_scc`
+/// and VALU `v_mov_b32 v0, src_scc`. SCC comes from `s_cmp_lg_u32 s0, 0`.
+#[test]
+fn src_scc_reads_the_scc_bit_as_a_number() {
+    const SRC_SCC: u8 = 253;
+    let s_cmp_lg_s0_0 = 0xBF07_8000; // s_cmp_lg_u32 s0, 0
+    let bodies: [(&[u32], fn(u32, u32) -> u32); 3] = [
+        (&[s_cmp_lg_s0_0, s_mov_b32(6, SRC_SCC), vop1(0x001, 0, sgpr(6))], |a, _| u32::from(a != 0)),
+        // s_add_u32 s6, s1, src_scc
+        (&[s_cmp_lg_s0_0, sop2(0x00, 6, 1, SRC_SCC), vop1(0x001, 0, sgpr(6))], |a, b| {
+            b.wrapping_add(u32::from(a != 0))
+        }),
+        (&[s_cmp_lg_s0_0, vop1(0x001, 0, u16::from(SRC_SCC))], |a, _| u32::from(a != 0)),
+    ];
+    for (body, expected) in bodies {
+        let shader = build_valu_cs(body);
+        run_cases(&shader, &[[0, 41, 0, 0], [7, 41, 0, 0], [0, u32::MAX, 0, 0], [1, u32::MAX, 0, 0]], |backend, _, inputs, got| {
+            assert_eq!(got, expected(inputs[0], inputs[1]), "{backend}: {body:08x?} with {inputs:?}");
+        });
+    }
+}
+
 #[test]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.

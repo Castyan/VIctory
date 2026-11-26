@@ -3426,6 +3426,11 @@ impl<'a> Lower<'a> {
                 self.i32_of(v)
             }
             super::pops::EXITING_WAVE_ID if super::pops::active(self.x.native) => Ok(self.s.m.i32(0)),
+            // `src_scc`: the SCC bit as 0 or 1 (the IR records the read).
+            Operand::Const(253) => {
+                let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+                self.i32_of(v)
+            }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
