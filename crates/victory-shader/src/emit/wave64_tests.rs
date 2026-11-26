@@ -1298,3 +1298,146 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+// ---- lane masks the code sets to constant lanes ----
+
+/// One console wave of 64 threads; thread t stores t + 1 to dwords 0..7 of its sixteen (64
+/// bytes at 64 t), each under EXEC set to constant lanes one of the ways the title's programs
+/// do it: `s_bfm_b64 exec, 32, 0` before a reduction over LDS; the halves moved apart
+/// (`s_mov_b32 exec_lo, 17`, `exec_hi`); `s_bitreplicate_b64_b32 exec, lit`; the low half alone
+/// after `s_mov_b64 exec, -1` (`s_mov_b32`, `s_pack_ll_b32_b16 exec_lo, 1, 1`); and the other
+/// 32-bit constants (`s_movk_i32`, `s_brev_b32`, `s_pack_lh/hh_b32_b16`). It stores EXEC as
+/// copied in the first two ways as numbers to dwords 8..11. The halves differ, so that lanes
+/// 32-63 taking the low half's bits shows.
+fn constant_exec_program() -> (NativeProgram, Vec<u32>) {
+    const ALL: u64 = u64::MAX;
+    let replicate = 0x0F0F_3C3Cu32;
+    let replicated = (0..32).filter(|n| replicate >> n & 1 == 1).fold(0u64, |r, n| r | 3 << (2 * n));
+    // (the code setting EXEC after `s_mov_b64 exec, -1`, the console's EXEC)
+    let cases: [(Vec<u32>, u64); 8] = [
+        (vec![sop2(0x25, EXEC, k(32), k(0))], 0xFFFF_FFFF), // s_bfm_b64 exec, 32, 0
+        (
+            vec![
+                sop1(0x03, EXEC, k(17)),   // s_mov_b32 exec_lo, 17
+                sop1(0x03, EXEC + 1, LIT), // s_mov_b32 exec_hi, 0x110000
+                0x0011_0000,
+            ],
+            0x0011_0000_0000_0011,
+        ),
+        (vec![sop1(0x3B, EXEC, LIT), replicate], replicated), // s_bitreplicate_b64_b32 exec, lit
+        (vec![sop1(0x03, EXEC, LIT), 0x0055_0055], ALL << 32 | 0x0055_0055), // s_mov_b32 exec_lo, lit
+        (vec![sop2(0x32, EXEC, k(1), LIT), 0x8003], ALL << 32 | 0x8003_0001), // s_pack_ll_b32_b16 exec_lo, 1, lit
+        (
+            vec![
+                0xB000_0000 | EXEC << 16 | 0x80FF, // s_movk_i32 exec_lo, 0x80ff: sign-extended
+                sop1(0x0B, EXEC + 1, k(15)),       // s_brev_b32 exec_hi, 15
+            ],
+            0xF000_0000_FFFF_80FF,
+        ),
+        // s_pack_hh_b32_b16 exec_hi, lit, -1
+        (vec![sop2(0x34, EXEC + 1, LIT, k(65)), 0x0009_0000], 0xFFFF_0009_FFFF_FFFF),
+        // s_pack_lh_b32_b16 exec_lo, lit, -16
+        (vec![sop2(0x33, EXEC, LIT, k(80)), 0x0000_0C03], ALL << 32 | 0xFFFF_0C03),
+    ];
+    let mut w = vec![
+        vop2(0x1A, 15, k(6), 0), // v_lshlrev_b32 v15, 6, v0: the thread's 64 bytes
+        vop2(0x25, 1, k(1), 0),  // v_add_nc_u32 v1, 1, v0
+    ];
+    for (n, (code, _)) in cases.iter().enumerate() {
+        w.push(sop1(0x04, EXEC, k(65))); // s_mov_b64 exec, -1 (k(65): the inline -1)
+        w.extend(code);
+        w.extend(store(1, 15, 4 * n as u32));
+        if n < 2 {
+            w.push(sop1(0x04, 20 + 2 * n as u32, EXEC)); // s_mov_b64 s[20 + 2n:21 + 2n], exec
+        }
+    }
+    w.push(sop1(0x04, EXEC, k(65))); // s_mov_b64 exec, -1
+    for (n, s) in [20u32, 21, 22, 23].into_iter().enumerate() {
+        w.push(vop1(0x01, 2, s)); // v_mov_b32 v2, s<s>
+        w.extend(store(2, 15, 32 + 4 * n as u32));
+    }
+    let console: Vec<u32> = (0..64u32)
+        .flat_map(|t| {
+            let mut d: Vec<u32> = cases.iter().map(|&(_, m)| if m >> t & 1 == 1 { t + 1 } else { 0 }).collect();
+            d.extend([0xFFFF_FFFF, 0, 0x11, 0x0011_0000, 0, 0, 0, 0]);
+            d
+        })
+        .collect();
+    (native(&w), console)
+}
+
+/// `native` as [`super::emit`] gives it to a host of 32-lane waves, validated by `dxil.dll`
+/// when present.
+fn chosen_for_32_lanes(native: &NativeProgram) -> HostShader {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(&c, native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("emit");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    shader
+}
+
+#[test]
+fn exec_set_to_constant_lanes_guards_both_halves_as_on_the_console() {
+    let (native, console) = constant_exec_program();
+    // the structurisation sees the constants, not masks it cannot see into
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let opaque = st.guards.iter().flatten().flatten().any(|&g| {
+        st.bools.support(g).iter().any(|a| matches!(a, structure::Atom::Opaque(_)))
+    });
+    assert!(!opaque, "a constant EXEC taken as an opaque mask");
+    // a host of 64-lane waves: the console's waves
+    let wide = lowered_for_width(&native, &p, &HashSet::new(), 64).expect("lower for 64 lanes");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut wide.dxil.clone()).expect("DXIL validation failed");
+    }
+    let narrow = chosen_for_32_lanes(&native);
+    let pair = paired(&native);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let run = |warp: bool, shader: &HostShader| -> Option<Vec<u32>> {
+        let host = Host::new(warp).map_err(|e| eprintln!("device: {e}")).ok()?;
+        let (root, pso) = host.compute_pipeline(shader).map_err(|e| eprintln!("pipeline: {e}")).ok()?;
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut out = host
+            .dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64 * 16)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            })
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out.swap_remove(0))
+    };
+    // (WARP's waves have 4 lanes: none of these forms runs there)
+    for (warp, shader, form) in [
+        (true, &wide, "64-lane waves on WARP"),
+        (false, &wide, "64-lane waves on the hardware device"),
+        (false, &narrow, "the form emit chooses for 32-lane waves"),
+        (false, &pair, "the paired form"),
+    ] {
+        match run(warp, shader) {
+            Some(got) => same_in_sixteen(&got, &console, form),
+            None => eprintln!("no device that takes {form}; not run"),
+        }
+    }
+}
+
+/// Panics at the first dword of `got` that is not the console's, naming the thread and which
+/// of its eight dwords.
+fn same_in_sixteen(got: &[u32], want: &[u32], run: &str) {
+    assert_eq!(got.len(), want.len());
+    if let Some(n) = (0..want.len()).find(|&n| got[n] != want[n]) {
+        panic!("{run}: thread {}, dword {}: {:#x}, the console's {:#x}", n / 16, n % 16, got[n], want[n]);
+    }
+    eprintln!("{run}: as on the console");
+}
