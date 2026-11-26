@@ -163,6 +163,8 @@ struct SerializedParam {
     root: RootType,
     dwords: u32,
     register: u32,
+    /// A root SRV: taken only where the table places it itself.
+    srv: bool,
 }
 
 /// `D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and
@@ -174,8 +176,9 @@ const HEAPS_INDEXED: u32 = 0xC00;
 /// parameter count, parameter offset, sampler count, sampler offset and
 /// flags, then per parameter u32 type, visibility and payload offset. A
 /// table (0) takes one user-data dword, root constants (1) as many as their
-/// count (the payload's third u32), a root CBV (2) two. Root SRVs and UAVs
-/// (3, 4) are refused: no captured table places one.
+/// count (the payload's third u32), a root CBV (2) two, a root SRV (3) two
+/// as well (a captured table places one in dwords 7 and 8, the next slot
+/// at 9). Root UAVs (4) are refused: no captured table places one.
 fn root_signature(blob: &[u8]) -> Result<(Vec<SerializedParam>, u32), ShaderError> {
     let rts0 = match crate::Container::parse(blob) {
         Ok(c) => {
@@ -196,19 +199,18 @@ fn root_signature(blob: &[u8]) -> Result<(Vec<SerializedParam>, u32), ShaderErro
         .map(|k| {
             let entry = at + 12 * k;
             let payload = u32_at(rts0, entry + 8)? as usize;
-            let (root, dwords) = match u32_at(rts0, entry)? {
+            let kind = u32_at(rts0, entry)?;
+            let (root, dwords) = match kind {
                 0 => (RootType::Table, 1),
                 1 => (RootType::Constants, u32_at(rts0, payload + 8)?),
-                2 => (RootType::Descriptor, 2),
-                3 | 4 => {
-                    return Err(Malformed(
-                        "a root SRV or UAV, whose user data no capture places",
-                    ));
+                2 | 3 => (RootType::Descriptor, 2),
+                4 => {
+                    return Err(Malformed("a root UAV, whose user data no capture places"));
                 }
                 _ => return Err(Malformed("unknown root parameter type")),
             };
             let register = if root == RootType::Table { 0 } else { u32_at(rts0, payload)? };
-            Ok(SerializedParam { root, dwords, register })
+            Ok(SerializedParam { root, dwords, register, srv: kind == 3 })
         })
         .collect::<Result<_, _>>()?;
     Ok((params, flags))
@@ -269,6 +271,11 @@ fn completed(
             return Err(Malformed(
                 "a root parameter cut by the end of the program's user SGPRs",
             ));
+        }
+        if p.srv {
+            // A root SRV the table does not name: what it is read as (and
+            // so its used resource) is not known.
+            return Err(Malformed("a root SRV the resource table does not place"));
         }
         out.push(RootParam {
             root: p.root,
@@ -827,10 +834,32 @@ mod tests {
         assert!(refused(completed(&moved, &four, 0, 10)).contains("places a root parameter"));
         let (tables, _) = root_signature(&rts0(&[(0, [0; 3]); 4], 0)).unwrap();
         assert!(refused(completed(&named(), &tables, 0, 10)).contains("places a root parameter"));
-        // Root SRVs and UAVs, which no table places, and short blobs.
-        assert!(root_signature(&rts0(&[(3, [0; 3])], 0)).is_err());
+        // Root UAVs, which no table places, and short blobs.
         assert!(root_signature(&rts0(&[(4, [0; 3])], 0)).is_err());
         assert!(root_signature(&rts0(&params, 0)[..20]).is_err());
+    }
+
+    /// A root SRV is taken where the table places it itself (as the title's
+    /// t1 in dwords 5 and 6 after a table in 4), and refused where only the
+    /// signature names it.
+    #[test]
+    fn a_root_srv_is_taken_only_where_the_table_places_it() {
+        let p = |root, user_data, sgprs, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let table = vec![p(RootType::Table, 4, 1, 0), p(RootType::Descriptor, 5, 2, 1)];
+        let (srv, flags) = root_signature(&rts0(&[(0, [0; 3]), (3, [1, 0, 0])], 0)).unwrap();
+        assert!(srv[1].srv);
+        assert_eq!(completed(&table, &srv, flags, 7).unwrap(), table);
+        // The same signature with only the table named: the root SRV is not
+        // taken from the signature alone.
+        let refused = completed(&table[..1], &srv, flags, 7);
+        assert!(matches!(refused, Err(Malformed(why)) if why.contains("root SRV")));
     }
 
     #[test]
