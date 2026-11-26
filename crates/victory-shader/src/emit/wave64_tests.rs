@@ -1756,3 +1756,10 @@ fn a_lane_of_a_sum_read_in_the_next_section_is_the_consoles_sum() {
     let (native, console) = next_section_program(false);
     as_on_the_console(&native, &console, 2);
 }
+
+#[test]
+fn a_section_left_for_lane_0_alone_stores_the_consoles_sum_from_lane_0() {
+    let (native, console) = next_section_program(true);
+    as_on_the_console(&native, &console, 2);
+}
+
