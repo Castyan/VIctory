@@ -402,6 +402,8 @@ struct Tracer<'a> {
     origin: Vec<Term>,
     /// See [`Resources::lane_copied`].
     lane_copied: std::cell::RefCell<Vec<Site>>,
+    /// Set when [`Self::made_raw`] took a descriptor for its load's.
+    raw: std::cell::Cell<bool>,
     lanes: Option<&'a Structured>,
     /// While set, [`Self::sum`] keeps the first-lane read of an index as
     /// the computed term instead of what the lanes hold.
@@ -475,6 +477,7 @@ impl<'a> Tracer<'a> {
             inputs,
             origin: Vec::new(),
             lane_copied: Default::default(),
+            raw: Default::default(),
             lanes,
             read_first_lane: Default::default(),
             meets: Default::default(),
@@ -1124,7 +1127,22 @@ impl<'a> Tracer<'a> {
             .ok_or("a descriptor not in SGPRs")?;
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
-        self.classify(&words, &mut Vec::new(), &mut known)
+        self.raw.set(false);
+        let source = self.classify(&words, &mut Vec::new(), &mut known)?;
+        // A structured buffer made raw has no stride and no format: an index
+        // would add nothing and a format read would read a raw dword, where
+        // the load's descriptor would not.
+        if self.raw.get() {
+            let by_byte = match inst.fields {
+                Fields::Buffer { idxen, .. } => !idxen && !inst.name().contains("format"),
+                Fields::Smem { .. } => true,
+                _ => false,
+            };
+            if !by_byte {
+                return Err("a structured buffer made raw, read by index or format");
+            }
+        }
+        Ok(source)
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
@@ -1169,6 +1187,10 @@ impl<'a> Tracer<'a> {
             return Ok(Source::Constant(consts));
         }
         if let Some(source) = self.loaded(words) {
+            return Ok(source);
+        }
+        if let Some(source) = self.made_raw(words) {
+            self.raw.set(true);
             return Ok(source);
         }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
@@ -2088,6 +2110,49 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// A structured buffer descriptor the console compiler makes raw, to
+    /// read the buffer by byte: dword 0 as loaded, dword 1 with the stride
+    /// cleared (`s_and_b32` by 0xc000ffff), dword 2 the record count times
+    /// the stride (`s_mul_i32` by `s_max_u32` of `s_bfe_u32` of dword 1,
+    /// 14 bits at 16, and 1), dword 3 with `OOB_SELECT` raw (`s_or_b32` of
+    /// 0x30000000, after an `s_and_b32` by 0xcfffffff or not). The memory
+    /// and its size in bytes are the load's, and the host's buffer views
+    /// are raw already: the load stands for it, as long as no access reads
+    /// it by index or format ([`Self::descriptor`]).
+    fn made_raw(&self, words: &[Term]) -> Option<Source> {
+        let &[w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = words else {
+            return None;
+        };
+        // The other operand of an SOP2 that wrote `v` from it and `k`.
+        let with = |v: Value, name: &str, k: u32| match self.sop2(v, &[name])?.1 {
+            [x, Term::Const(c)] | [Term::Const(c), x] if c == k => Some(x),
+            _ => None,
+        };
+        let value = |t: Term| match t {
+            Term::Value(v) => Some(v),
+            Term::Const(_) => None,
+        };
+        let x1 = with(w1, "s_and_b32", 0xC000_FFFF)?;
+        let mut x3 = with(w3, "s_or_b32", 0x3000_0000)?;
+        if let Some(x) = value(x3).and_then(|v| with(v, "s_and_b32", 0xCFFF_FFFF)) {
+            x3 = x;
+        }
+        let (_, [a, b]) = self.sop2(w2, &["s_mul_i32"])?;
+        let is_stride = |t: Term| {
+            value(t)
+                .and_then(|v| with(v, "s_max_u32", 1))
+                .and_then(value)
+                .and_then(|v| with(v, "s_bfe_u32", 0x000E_0010))
+                == Some(x1)
+        };
+        let x2 = match (is_stride(a), is_stride(b)) {
+            (_, true) => a,
+            (true, false) => b,
+            (false, false) => return None,
+        };
+        self.loaded(&[w0, x1, x2, x3])
+    }
+
     /// A descriptor the code keeps per lane: every dword of `words` is the
     /// first lane (`v_readfirstlane_b32`) of a VGPR that `v_mov_b32` filled
     /// from SGPRs. The console compiler does this to a descriptor loaded on
@@ -2814,6 +2879,74 @@ pub(crate) mod tests {
             err,
             ShaderError::Unsupported {
                 offset: 36,
+                what: "a descriptor changed after loading"
+            }
+        );
+    }
+
+    /// A structured buffer made raw as the title's 0x218 programs do
+    /// (`slot218-m005`, `m006`, `m008`), then `last` (an access through it),
+    /// with `count` the third dword times what `s_mul_i32` reads.
+    fn made_raw(count: u32, last: [u32; 2]) -> Vec<u32> {
+        vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+            0x9388_FF05,
+            0x000E_0010, // s_bfe_u32 s8, s5, 0xe0010
+            0x8488_8108, // s_max_u32 s8, s8, 1
+            0x8707_FF07,
+            0xCFFF_FFFF, // s_and_b32 s7, s7, 0xcfffffff
+            count,       // s_mul_i32 s6, s6, ...
+            0x8807_FF07,
+            0x3000_0000, // s_or_b32 s7, s7, 0x30000000
+            0x8705_FF05,
+            0xC000_FFFF, // s_and_b32 s5, s5, 0xc000ffff
+            last[0],
+            last[1],
+            S_ENDPGM,
+        ]
+    }
+
+    const MUL_BY_STRIDE: u32 = 0x9306_0806; // s_mul_i32 s6, s6, s8
+    const BY_BYTE: [u32; 2] = [0xE030_1034, 0x8001_0100]; // buffer_load_dword v1, v0, s[4:7], 0 offen offset:52
+
+    #[test]
+    fn a_structured_buffer_made_raw_is_its_load() {
+        let code = made_raw(MUL_BY_STRIDE, BY_BYTE);
+        let r = track_words(&code, &[param(Table, 9, 1)], HwStage::Ps);
+        assert_eq!(r.scalar, [((0, 2), at(0, 0))]);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 2),
+                first: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_structured_buffer_made_raw_read_by_index_or_changed_otherwise_fails() {
+        let fails = |code: Vec<u32>| {
+            let code: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err()
+        };
+        // Stride 0 drops an index the load's descriptor would scale.
+        let by_index = [0xE030_2000, 0x8001_0100]; // buffer_load_dword v1, v0, s[4:7], 0 idxen
+        assert_eq!(
+            fails(made_raw(MUL_BY_STRIDE, by_index)),
+            ShaderError::Unsupported {
+                offset: 0x38,
+                what: "a structured buffer made raw, read by index or format"
+            }
+        );
+        // A record count times something else than the stride is another size.
+        assert_eq!(
+            fails(made_raw(0x9306_0A06, BY_BYTE)), // s_mul_i32 s6, s6, s10
+            ShaderError::Unsupported {
+                offset: 0x38,
                 what: "a descriptor changed after loading"
             }
         );
