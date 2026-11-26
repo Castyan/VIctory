@@ -2421,6 +2421,19 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         let shift = constant_operand(*shift)? & 31;
         return Some(Moved::Const(((1u32 << width) - 1) << shift));
     }
+    // Bits `shift` up of a field of `width` ones, both from bits 5:0 (the
+    // 0x218 programs' samplers: `s_bfm_b64 s[44:45], 2, 54`).
+    if inst.name() == "s_bfm_b64" {
+        let [width, shift] = src.as_slice() else { return None };
+        let width = constant_operand(*width)? & 63;
+        let shift = constant_operand(*shift)? & 63;
+        let field = ((1u64 << width) - 1) << shift;
+        return match k {
+            0 => Some(Moved::Const(field as u32)),
+            1 => Some(Moved::Const((field >> 32) as u32)),
+            _ => None,
+        };
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2559,6 +2572,48 @@ pub(crate) mod tests {
         );
         let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
         assert_eq!(sampler.source, Source::Constant(vec![0, 0xf8, 0x8000_0001, 0]));
+    }
+
+    /// The 0x218 programs make an immediate sampler with `s_bfm_b64
+    /// s[44:45], 2, 54` (dword 1 = 3 << 22: MAX_LOD 12) and `s_mov_b64
+    /// s[46:47], 0x18500000`; untracked, its first two dwords looked like
+    /// an address and the program was refused as "an address not from a
+    /// root parameter".
+    #[test]
+    fn a_64_bit_bitmask_can_supply_static_sampler_words() {
+        let r = track_words(
+            &[
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001, 0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0x9288_B682, // s_bfm_b64 s[8:9], 2, 54
+                0xBE8A_04FF, 0x1850_0000, // s_mov_b64 s[10:11], 0x18500000
+                0xF080_0F08, 0x0040_0002, // image_sample using s[8:11] as its sampler
+                S_ENDPGM,
+            ],
+            &[param(Table, 2, 1)],
+            HwStage::Cs,
+        );
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
+        assert_eq!(sampler.source, Source::Constant(vec![0, 0x00C0_0000, 0x1850_0000, 0]));
+        // A field across both dwords: s_bfm_b64 s[8:9], 40, 20.
+        let r = track_words(
+            &[
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001, 0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0x9288_94A8, // s_bfm_b64 s[8:9], 40, 20
+                0xBE8A_0480, // s_mov_b64 s[10:11], 0
+                0xF080_0F08, 0x0040_0002, // image_sample using s[8:11] as its sampler
+                S_ENDPGM,
+            ],
+            &[param(Table, 2, 1)],
+            HwStage::Cs,
+        );
+        let field = ((1u64 << 40) - 1) << 20;
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
+        assert_eq!(
+            sampler.source,
+            Source::Constant(vec![field as u32, (field >> 32) as u32, 0, 0])
+        );
     }
 
     #[test]
