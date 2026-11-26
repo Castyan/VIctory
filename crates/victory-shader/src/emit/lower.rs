@@ -10570,15 +10570,22 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                // shortcut: typed stores are taken to be of a float format.
+                // The `count` channels given are the first ones, and the
+                // others are written as 0, as `image_store` writes channels
+                // its dmask leaves out: a typed UAV store writes all four,
+                // and the host format drops those past its width.
+                if *offen || *offset != 0 {
+                    return Err("a typed buffer store at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
-                for x in vals {
-                    args.push(self.as_float(x));
+                let zero = self.s.m.f32(0);
+                for k in 0..4 {
+                    args.push(match vals.get(k) {
+                        Some(&x) => self.as_float(x),
+                        None => zero,
+                    });
                 }
                 (69, "bufferStore.f32")
             } else {
