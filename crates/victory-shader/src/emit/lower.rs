@@ -10509,7 +10509,8 @@ impl<'a> Lower<'a> {
         // min and max, exchange; compare-exchange apart.
         let atomic = match name.strip_prefix("buffer_atomic_") {
             None => None,
-            Some("add") => Some(0),
+            // (sub: an add of the negated value, the same modulo 2^32)
+            Some("add" | "sub") => Some(0),
             Some("and") => Some(1),
             Some("or") => Some(2),
             Some("xor") => Some(3),
@@ -10773,7 +10774,12 @@ impl<'a> Lower<'a> {
             } else {
                 let mut args = vec![h, self.s.m.i32(op)];
                 args.extend(coords);
-                args.push(vals[0]);
+                args.push(if name == "buffer_atomic_sub" {
+                    let zero = self.s.m.i32(0);
+                    self.s.m.bin(self.cur, Bin::Sub, zero, vals[0])
+                } else {
+                    vals[0]
+                });
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };

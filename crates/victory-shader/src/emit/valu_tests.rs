@@ -2451,3 +2451,26 @@ fn clamped_unsigned_add_and_sub_saturate() {
         }
     }
 }
+
+/// `buffer_atomic_sub` (MUBUF 0x33), as `slot218-m178` at 0x19a0: three subtractions from
+/// dword 0 of the raw UAV, the last with glc, which returns the dword before it: 0 - s0 - s1
+/// modulo 2^32, on the card and on WARP.
+#[test]
+fn buffer_atomic_sub_subtracts_modulo_2_32_and_returns_the_old_dword() {
+    // buffer_atomic_sub v<data>, v5, s[8:11], 0 offen [glc]
+    const fn sub(data: u32, glc: bool) -> [u32; 2] {
+        [0x38 << 26 | 0x33 << 18 | (glc as u32) << 14 | 1 << 12, 0x80 << 24 | 2 << 16 | data << 8 | 5]
+    }
+    let mut body = vec![vop1(0x001, 5, 128), vop1(0x001, 0, 128)]; // v5 = 0, v0 = 0
+    body.extend(sub(1, false));
+    body.extend(sub(2, false));
+    body.extend(sub(0, true));
+    body.push(0xBF8C_3F70); // s_waitcnt vmcnt(0)
+    let shader = build_valu_cs(&body);
+    let edges = [0, 1, 7, 0x8000_0000, 0xFFFF_FFFF];
+    let cases: Vec<[u32; 4]> = edges.iter().flat_map(|&a| edges.iter().map(move |&b| [a, b, 0, 0])).collect();
+    run_cases(&shader, &cases, |backend, _, i, got| {
+        let want = 0u32.wrapping_sub(i[0]).wrapping_sub(i[1]);
+        assert_eq!(got, want, "{backend}: 0 - {:#x} - {:#x}", i[0], i[1]);
+    });
+}
