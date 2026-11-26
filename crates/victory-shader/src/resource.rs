@@ -1003,6 +1003,25 @@ impl<'a> Tracer<'a> {
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
+            || matches!(hi, Term::Value(v) if self.plus_scc(v) == Some(want))
+    }
+
+    /// `x` where `v` is `s_add_u32 v, x, src_scc` (either way round): `x`
+    /// plus the carry, as `s_addc_u32 v, x, 0` gives it (the 0x218
+    /// programs' heap addresses: `s_add_u32 s41, 0, src_scc`).
+    fn plus_scc(&self, v: Value) -> Option<Term> {
+        const SRC_SCC: Operand = Operand::Const(253);
+        let inst = self.def(v)?;
+        if inst.name() != "s_add_u32" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        match src.as_slice() {
+            [x, SRC_SCC] | [SRC_SCC, x] => self.term(inst, x),
+            _ => None,
+        }
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
@@ -2571,6 +2590,29 @@ pub(crate) mod tests {
             r.params.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(),
             [(0, 0), (0, 1)]
         );
+    }
+
+    /// As a 0x218 program reads its view heap: the heap's dword plus an
+    /// index, and the high half the carry of that sum through `src_scc`.
+    #[test]
+    fn a_heap_address_whose_high_half_is_the_carry_by_src_scc() {
+        let code = [
+            0x8F08_8506, // s_lshl_b32 s8, s6, 5
+            0x8014_080A, // s_add_u32 s20, s10, s8
+            0x8015_FD80, // s_add_u32 s21, 0, src_scc
+            0xF408_030A,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[20:21], null
+            0xE000_2000,
+            0x8003_0400, // buffer_load_format_x v4, v0, s[12:15], 0 idxen
+            S_ENDPGM,
+        ];
+        let r = track_words(
+            &code,
+            &[param(Constants, 6, 1), param(ResourceHeap, 10, 1)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar[0].1.param, 1);
+        assert!(r.scalar[0].1.dynamic.is_some());
     }
 
     #[test]
