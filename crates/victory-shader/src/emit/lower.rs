@@ -8437,12 +8437,103 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// `v_pk_fmac_f16` (VOP2): each half of the destination becomes
+    /// `S0 * S1 + D` of the same halves, fused and rounded once to the
+    /// nearest even f16, f16 denormals kept.
+    ///
+    /// The product of two halves is exact in f32 and so is the error of the
+    /// f32 sum (TwoSum; every value is a multiple of 2^-48, never an f32
+    /// denormal, and below 2^33). That sum rounded to odd (its last bit set
+    /// where it is inexact) and then to the nearest f16 is the fused result
+    /// rounded once (24 bits >= 11 + 2). The last rounding is
+    /// [`Self::f16_nearest`]: the host's own conversion may round toward
+    /// zero. NaNs stay NaNs, but their bits are the host's.
+    fn packed_fmac_f16(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("v_pk_fmac_f16 with SDWA or DPP");
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a packed result outside a VGPR");
+        };
+        // A literal in a VOP2 packed operation: only one whose halves agree,
+        // which reads the same whichever half the hardware replicates.
+        match v.src.first() {
+            Some(Operand::Literal(x)) if x >> 16 != x & 0xFFFF => {
+                return Err("a packed literal with two different halves");
+            }
+            Some(Operand::Const(_)) => return Err("an inline constant in v_pk_fmac_f16"),
+            _ => {}
+        }
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let srcs = [
+            self.operand(inst, v.src.first().ok_or("a missing operand")?)?,
+            self.operand(inst, v.src.get(1).ok_or("a missing operand")?)?,
+            self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?,
+        ];
+        let (k16, low, one, zero) = (
+            self.s.m.i32(16),
+            self.s.m.i32(0xFFFF),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let mut halves = Vec::new();
+        for high in [false, true] {
+            let mut x = Vec::new();
+            for &s in &srcs {
+                let h = if high {
+                    self.s.m.bin(c, Bin::LShr, s, k16)
+                } else {
+                    s
+                };
+                let h = self.s.m.bin(c, Bin::And, h, low);
+                x.push(self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]));
+            }
+            let p = self.s.m.bin(c, Bin::Mul, x[0], x[1]);
+            let sum = self.s.m.bin(c, Bin::Add, p, x[2]);
+            // TwoSum: err = (p - (sum - bb)) + (acc - bb), bb = sum - p.
+            let bb = self.s.m.bin(c, Bin::Sub, sum, p);
+            let pa = self.s.m.bin(c, Bin::Sub, sum, bb);
+            let pe = self.s.m.bin(c, Bin::Sub, p, pa);
+            let ae = self.s.m.bin(c, Bin::Sub, x[2], bb);
+            let err = self.s.m.bin(c, Bin::Add, pe, ae);
+            // Inexact (never for NaN or infinity, whose error is NaN) and even:
+            // one step toward the error, away from zero where it has the sum's sign.
+            let fz = self.s.m.f32(0);
+            let inexact = self.s.m.cmp(c, pred::ONE, err, fz);
+            let bits = self.as_int(sum);
+            let ebits = self.as_int(err);
+            let last = self.s.m.bin(c, Bin::And, bits, one);
+            let even = self.s.m.cmp(c, pred::EQ, last, zero);
+            let step = self.s.m.bin(c, Bin::And, inexact, even);
+            let signs = self.s.m.bin(c, Bin::Xor, bits, ebits);
+            let apart = self.s.m.cmp(c, pred::SLT, signs, zero);
+            let ones = self.s.m.i32(u32::MAX);
+            let delta = self.s.m.select(c, apart, ones, one);
+            let delta = self.s.m.select(c, step, delta, zero);
+            let odd = self.s.m.bin(c, Bin::Add, bits, delta);
+            let odd = self.s.m.cast(c, Cast::Bitcast, odd, f32t);
+            let h = self.f16_nearest(odd);
+            halves.push(self.s.m.bin(c, Bin::And, h, low));
+        }
+        let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+        let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+        self.write(inst, Reg::V(reg), r, guard);
+        Ok(())
+    }
+
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
     /// 16-bit operation does, f16 through f32 as in [`Self::valu16`].
     fn packed16(&mut self, inst: &Inst, op: &str, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
+        if op == "fmac_f16" {
+            return self.packed_fmac_f16(inst, guard);
+        }
         let float = op.ends_with("_f16");
         let n = match op {
             "fma_f16" | "mad_u16" | "mad_i16" => 3,

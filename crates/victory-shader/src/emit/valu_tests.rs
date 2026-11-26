@@ -2287,3 +2287,137 @@ fn scalar_sign_extensions_take_the_low_bits_and_keep_scc() {
         });
     }
 }
+
+/// An f16's value in units of 2^-24 (`None` for infinity and NaN).
+fn f16_units(h: u16) -> Option<i128> {
+    let (e, f) = (i128::from(h >> 10 & 0x1F), i128::from(h & 0x3FF));
+    let m = match e {
+        0x1F => return None,
+        0 => f,
+        _ => (1024 + f) << (e - 1),
+    };
+    Some(if h & 0x8000 != 0 { -m } else { m })
+}
+
+/// `x` (units of 2^-48, not zero) rounded once to the nearest even f16.
+fn f16_rounded(x: i128) -> u16 {
+    let sign = if x < 0 { 0x8000 } else { 0 };
+    let mag = x.unsigned_abs();
+    // The f16 step at this size, in units of 2^-48: 2^24 below 2^-14 (2^34 units).
+    let top = 127 - mag.leading_zeros(); // floor(log2 mag)
+    let shift = if top < 34 { 24 } else { top - 10 };
+    let (q, rest, half) = (mag >> shift, mag & ((1 << shift) - 1), 1u128 << (shift - 1));
+    let q = if rest > half || rest == half && q & 1 != 0 { q + 1 } else { q };
+    let bits = if top < 34 { q } else { (u128::from(top + 15 - 48) << 10) + q - 1024 };
+    sign | bits.min(0x7C00) as u16
+}
+
+/// The console's `v_pk_fmac_f16` on one half: `a * b + c` rounded once to the
+/// nearest even f16, denormals kept (`None` for an infinite or NaN operand).
+fn fma_f16(a: u16, b: u16, c: u16) -> Option<u16> {
+    let p = f16_units(a)? * f16_units(b)?;
+    let s = p + (f16_units(c)? << 24);
+    Some(if s != 0 {
+        f16_rounded(s)
+    } else {
+        // An exact zero: -0 only when both terms are -0 (or a negative zero product).
+        let p_neg = (a ^ b) & 0x8000 != 0;
+        if p == 0 && p_neg && c & 0x8000 != 0 && f16_units(c) == Some(0) { 0x8000 } else { 0 }
+    })
+}
+
+/// `v_pk_fmac_f16 v0, v1, v2` (v0 = s2 first): each half fused and rounded
+/// once to the nearest even f16, against an exact integer reference. The
+/// cases include sums that round differently when an f32 sum is rounded
+/// again to f16 (a product on a midpoint plus the smallest denormal), the
+/// denormal range, overflow to infinity, signed zeros, and a literal with
+/// equal halves as the 0x218 programs use it.
+#[test]
+fn packed_fmac_f16_rounds_the_fused_sum_once() {
+    const fn vop2(op: u32, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+        op << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | src0 as u32
+    }
+    let fmac = [vop1(0x001, 0, vgpr(3)), vop2(0x3c, 0, vgpr(1), 2)];
+    // (a, b, c) per half.
+    let mut halves: Vec<[u16; 3]> = vec![
+        [0x3C00, 0x3C00, 0x3C00],             // 1 * 1 + 1
+        [0x3C01, 0x3C01, 0x0001],             // (1 + 2^-10)^2 + the smallest denormal
+        [0x3C01, 0x3C01, 0x8001],
+        [0x3C01, 0x3BFF, 0x0001],
+        [0x3E00, 0x3C01, 0x0001],             // 1.5 * (1 + 2^-10): a midpoint above 1.5
+        [0x3E00, 0x3C01, 0x8001],
+        [0x0001, 0x0001, 0x0000],             // 2^-48: rounds to +0
+        [0x0001, 0x3800, 0x0001],             // half the smallest denormal plus it: a tie
+        [0x0003, 0x3800, 0x0000],             // 1.5 denormals: tie to even (2)
+        [0x0200, 0x4000, 0x8001],             // denormal arithmetic
+        [0x03FF, 0x3C00, 0x0001],             // the largest denormal to the smallest normal
+        [0x7BFF, 0x3C00, 0x5000],             // 65504 + 32: overflow (65536 rounds up)
+        [0x7BFF, 0x3C00, 0x4C00],             // 65504 + 16: the tie to infinity
+        [0x7BFF, 0x3C00, 0x4BFF],             // just below the tie: 65504
+        [0x7BFF, 0x7BFF, 0xFBFF],             // product far past f16, minus the largest
+        [0x8000, 0x3C00, 0x0000],             // -0 + +0 = +0
+        [0x8000, 0x3C00, 0x8000],             // -0 + -0 = -0
+        [0x3C00, 0x3C00, 0xBC00],             // 1 - 1 = +0
+        [0xC500, 0x4248, 0x5640],
+        [0x1400, 0x1400, 0x0400],             // tiny products onto the smallest normal
+    ];
+    // Pseudo-random finite halves, and the sums an f32 sum rounded again
+    // to f16 gets wrong.
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let h = (seed >> 20) as u16;
+        if h & 0x7C00 == 0x7C00 { h & 0xBBFF } else { h }
+    };
+    let twice = |a: u16, b: u16, c: u16| {
+        let f = |h: u16| f16_units(h).unwrap() as f32 * 2f32.powi(-24);
+        let s = f(a).mul_add(f(b), f(c));
+        if s == 0.0 { None } else { Some(f16_rounded((f64::from(s) * 2f64.powi(48)) as i128)) }
+    };
+    let (mut random, mut wrong_twice) = (0, 0);
+    while random < 24 || wrong_twice < 16 {
+        let (a, b, c) = (next(), next(), next());
+        let differs = twice(a, b, c).is_some_and(|t| Some(t) != fma_f16(a, b, c));
+        if differs && wrong_twice < 16 {
+            wrong_twice += 1;
+            halves.push([a, b, c]);
+        } else if random < 24 {
+            random += 1;
+            halves.push([a, b, c]);
+        }
+    }
+    let pack = |lo: u16, hi: u16| u32::from(hi) << 16 | u32::from(lo);
+    let cases: Vec<[u32; 4]> = halves
+        .chunks(2)
+        .map(|h| {
+            let hi = h.get(1).unwrap_or(&h[0]);
+            [pack(h[0][0], hi[0]), pack(h[0][1], hi[1]), pack(h[0][2], hi[2]), 0]
+        })
+        .collect();
+    let shader = build_valu_cs(&fmac);
+    run_cases(&shader, &cases, |backend, _, i, got| {
+        for (k, got) in [(0, got as u16), (16, (got >> 16) as u16)] {
+            let (a, b, c) = ((i[0] >> k) as u16, (i[1] >> k) as u16, (i[2] >> k) as u16);
+            let want = fma_f16(a, b, c).unwrap();
+            assert_eq!(got, want, "{backend}: fma({a:#06x}, {b:#06x}, {c:#06x}) = {got:#06x}, want {want:#06x}");
+        }
+    });
+    // Infinities and NaN: infinity stays infinity, 0 * infinity is NaN.
+    run_cases(&shader, &[[pack(0x7C00, 0x0000), pack(0x3C00, 0x7C00), pack(0x3C00, 0x3C00), 0]], |backend, _, _, got| {
+        assert_eq!(got & 0xFFFF, 0x7C00, "{backend}: inf * 1 + 1");
+        assert!(got >> 16 & 0x7FFF > 0x7C00, "{backend}: 0 * inf + 1 = {:#06x}, want a NaN", got >> 16);
+    });
+    // v_pk_fmac_f16 v0, lit(0x31d731d7), v2 (a 0x218 program's form).
+    let mut lit = vec![vop1(0x001, 0, vgpr(3)), vop2(0x3c, 0, 255, 2)];
+    lit.push(0x31D7_31D7);
+    let shader = build_valu_cs(&lit);
+    let inputs = [[0, pack(0x4248, 0xC500), pack(0x0001, 0x7BFF), 0], [0, pack(0x3C01, 0x0003), pack(0xB800, 0x1400), 0]];
+    run_cases(&shader, &inputs, |backend, _, i, got| {
+        for k in [0, 16] {
+            let want = fma_f16(0x31D7, (i[1] >> k) as u16, (i[2] >> k) as u16).unwrap();
+            assert_eq!((got >> k) as u16, want, "{backend}: literal case, half at bit {k}");
+        }
+    });
+}
