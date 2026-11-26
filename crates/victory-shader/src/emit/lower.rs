@@ -8718,6 +8718,49 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
             }
+            "v_mad_u32_u16" => {
+                // D = S0[15:0] * S1[15:0] + S2, both halves zero-extended, the sum
+                // wrapping at 32 bits; op_sel bits 0-1 take a register's high half.
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                if v.opsel & 0b1100 != 0 {
+                    return Err("op_sel on a 32-bit operand");
+                }
+                let mut halves = [None; 2];
+                for (j, half) in halves.iter_mut().enumerate() {
+                    if v.abs >> j & 1 != 0 || v.neg >> j & 1 != 0 {
+                        return Err("integer operand modifiers");
+                    }
+                    let high = v.opsel >> j & 1 != 0;
+                    // Only registers have a known high half; an inline float is
+                    // not taken as either width's bits.
+                    match v.src.get(j) {
+                        Some(Operand::Const(240..=248)) => {
+                            return Err("an inline float on a 16-bit integer operand");
+                        }
+                        Some(Operand::Const(_) | Operand::Literal(_)) if high => {
+                            return Err("op_sel on a constant");
+                        }
+                        _ => {}
+                    }
+                    let x = s(self, j)?;
+                    let x = if high {
+                        let k16 = k(self, 16);
+                        self.s.m.bin(c, Bin::LShr, x, k16)
+                    } else {
+                        x
+                    };
+                    let low = k(self, 0xFFFF);
+                    *half = Some(self.s.m.bin(c, Bin::And, x, low));
+                }
+                let [Some(a), Some(b)] = halves else {
+                    unreachable!()
+                };
+                let d = s(self, 2)?;
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
+            }
             "v_min3_i32" | "v_max3_i32" | "v_min3_u32" | "v_max3_u32" | "v_med3_i32"
             | "v_med3_u32" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
