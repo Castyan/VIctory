@@ -2288,6 +2288,36 @@ fn scalar_sign_extensions_take_the_low_bits_and_keep_scc() {
     }
 }
 
+/// `s_absdiff_i32 s6, s0, s1`: |s0 - s1| in wrapping i32 (an overflowing
+/// difference, i32::MIN included, stays i32::MIN), SCC = result != 0.
+#[test]
+fn scalar_absdiff_wraps_and_sets_scc() {
+    const SRC_SCC: u16 = 253;
+    let absdiff: u32 = 0x8000_0000 | 0x2c << 23 | 6 << 16 | 1 << 8; // SOP2 0x2c: s_absdiff_i32 s6, s0, s1
+    let expected = |i: [u32; 4]| (i[0] as i32).wrapping_sub(i[1] as i32).wrapping_abs() as u32;
+    let inputs = [
+        [0, 0, 0, 0],
+        [5, 7, 0, 0],
+        [7, 5, 0, 0],
+        [0x8000_0000, 0, 0, 0],
+        [0, 0x8000_0000, 0, 0],
+        [0x8000_0000, 1, 0, 0],
+        [0x7FFF_FFFF, 0xFFFF_FFFF, 0, 0],
+        [0x8000_0000, 0x7FFF_FFFF, 0, 0],
+        [0xFFFF_FFFF, 0x8000_0000, 0, 0],
+        [0x8000_0000, 0x8000_0000, 0, 0],
+        [0x1234_5678, 0x9ABC_DEF0, 0, 0],
+    ];
+    let value = [absdiff, vop1(0x001, 0, sgpr(6))];
+    run_cases(&build_valu_cs(&value), &inputs, |backend, _, i, got| {
+        assert_eq!(got, expected(i), "{backend}: s_absdiff_i32 of {i:x?}");
+    });
+    let scc = [absdiff, vop1(0x001, 0, SRC_SCC)];
+    run_cases(&build_valu_cs(&scc), &inputs, |backend, _, i, got| {
+        assert_eq!(got, u32::from(expected(i) != 0), "{backend}: SCC after s_absdiff_i32 of {i:x?}");
+    });
+}
+
 /// An f16's value in units of 2^-24 (`None` for infinity and NaN).
 fn f16_units(h: u16) -> Option<i128> {
     let (e, f) = (i128::from(h >> 10 & 0x1F), i128::from(h & 0x3FF));

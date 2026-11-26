@@ -5953,8 +5953,13 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.cmp(c, p, a, b);
                 (self.s.m.select(c, t, a, b), None)
             }
-            "s_abs_i32" => {
-                let a = src32(self, 0)?;
+            "s_abs_i32" | "s_absdiff_i32" => {
+                // |src0| or |src0 - src1|, wrapping (i32::MIN stays i32::MIN); SCC = result != 0.
+                let mut a = src32(self, 0)?;
+                if name == "s_absdiff_i32" {
+                    let b = src32(self, 1)?;
+                    a = self.s.m.bin(c, Bin::Sub, a, b);
+                }
                 let z = self.s.m.i32(0);
                 let neg = self.s.m.cmp(c, pred::SLT, a, z);
                 let n = self.s.m.bin(c, Bin::Sub, z, a);
