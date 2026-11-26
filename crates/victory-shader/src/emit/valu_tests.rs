@@ -2207,6 +2207,51 @@ fn ldexp_scales_by_a_power_of_two_rounded_once() {
     });
 }
 
+/// `v_mad_u32_u16`: the low (or, with op_sel, high) halves of src0 and src1,
+/// zero-extended, multiplied, plus all 32 bits of src2, wrapping. The forms the
+/// 0x218 programs use: registers with op_sel on either source, a literal or an
+/// inline integer for src0, and 0 or a full dword for src2.
+#[test]
+fn mad_u32_u16_multiplies_the_selected_halves() {
+    const LITERAL: u16 = 255;
+    let mad = |src0: u16, src1: u16, src2: u16, opsel: u32| {
+        let [w0, w1] = vop3(0x373, 0, src0, src1, src2);
+        [w0 | opsel << 11, w1]
+    };
+    type Case = (Vec<u32>, Box<dyn Fn([u32; 4]) -> u32>);
+    let half = |x: u32, high: bool| if high { x >> 16 } else { x & 0xFFFF };
+    let mut cases: Vec<Case> = Vec::new();
+    for opsel in 0..4u32 {
+        cases.push((
+            mad(vgpr(1), vgpr(2), vgpr(3), opsel).to_vec(),
+            Box::new(move |i| {
+                half(i[0], opsel & 1 != 0).wrapping_mul(half(i[1], opsel & 2 != 0)).wrapping_add(i[2])
+            }),
+        ));
+    }
+    // v_mad_u32_u16 v0, lit(0x62c), sel_hi(v2), 0
+    let mut lit = mad(LITERAL, vgpr(2), 128, 2).to_vec();
+    lit.push(0x0000_062C);
+    cases.push((lit, Box::new(move |i| 0x62C * half(i[1], true))));
+    // v_mad_u32_u16 v0, 48, v2, s3 (inline integer constants are their own value)
+    cases.push((mad(128 + 48, vgpr(2), sgpr(3), 0).to_vec(), Box::new(move |i| (48 * half(i[1], false)).wrapping_add(i[3]))));
+    // v_mad_u32_u16 v0, 24, sel_hi(v2), v4
+    cases.push((mad(128 + 24, vgpr(2), vgpr(4), 2).to_vec(), Box::new(move |i| (24 * half(i[1], true)).wrapping_add(i[3]))));
+    let inputs = [
+        [0x1234_5678, 0x9ABC_DEF0, 0x0000_0001, 0x7FFF_FFFF],
+        [0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF],
+        [0x0001_FFFF, 0xFFFF_0002, 0x8000_0000, 3],
+        [0, 0xFFFF_0000, 0, 0],
+        [0x8000_8000, 0x8000_8000, 0x4000_0000, 0xC000_0000],
+    ];
+    for (body, expected) in cases {
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &inputs, |backend, _, i, got| {
+            assert_eq!(got, expected(i), "{backend}: {body:08x?} with {i:x?}");
+        });
+    }
+}
+
 /// `s_sext_i32_i8` and `s_sext_i32_i16`: the low byte or word of s0,
 /// sign-extended; SCC (set from s1 beforehand) stays as it was.
 #[test]
