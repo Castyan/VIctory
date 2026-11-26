@@ -346,8 +346,14 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device method 0x1c8. Native graphics state still needs render-target
-/// formats from the draw. Leave the output null so the caller can fall back.
+/// Device method 0x1c8 (title+0x2477578): a graphics pipeline from programs
+/// the title compiled itself, called as `(this, description, interface id,
+/// out)` for `ID3D12PipelineState`. On failure the title goes without that
+/// pipeline, silently. The first calls log the description's words and what
+/// its first word points at.
+/// shortcut: not implemented. A host pipeline also needs the render-target
+/// formats, which only the draw gives; answering `S_OK` without making the
+/// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_graphics_pipeline(
     _: This,
     desc: *const u8,

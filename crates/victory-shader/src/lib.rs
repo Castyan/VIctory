@@ -94,13 +94,12 @@ translation_inputs! {
 mod source_tests {
     use std::path::{Path, PathBuf};
 
-    // host.rs consumes finished DXIL to create or run host pipelines. The
+    // host.rs consumes finished DXIL to create or run host pipelines.
+    // native_build.rs only writes containers: what it writes is hashed as
+    // any container is, so it cannot change a translation kept on disk. The
     // remaining modules are only compiled by the Windows execution tests.
     const OUTSIDE_TRANSLATION: &[&str] = &[
         "emit/cube_lod_tests.rs",
-        // (programs the title hands over compiled, wrapped in a container that the
-        // translation then reads as any other)
-        "native_build.rs",
         "emit/descriptor_tests.rs",
         "emit/diff_tests.rs",
         "emit/helper_lane_tests.rs",
@@ -110,6 +109,7 @@ mod source_tests {
         "emit/valu_tests.rs",
         "emit/waterfall_tests.rs",
         "emit/wave64_tests.rs",
+        "native_build.rs",
     ];
 
     #[test]
