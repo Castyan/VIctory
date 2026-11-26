@@ -1360,6 +1360,77 @@ fn run_once(warp: bool, shader: &HostShader, dwords: u32) -> Option<Vec<u32>> {
     Some(out.swap_remove(0))
 }
 
+// ---- a lane of a reduction read past the restore of EXEC ----
+
+/// One console wave of 64 threads; the threads below 40 sum t + 1 over the wave as the title's
+/// programs do (`v_cndmask` of the saved EXEC, DPP and `v_permlanex16` over each half, lane 0
+/// added to every lane), but read lane 63, the only one holding the whole sum, after restoring
+/// EXEC and after `s_and_saveexec` to the threads below 20 (0x218 m133 at 0x124-0x128). Those
+/// store it to dword 0 of their two (8 bytes at 8 t) and t + 1 to dword 1.
+fn lane_read_past_the_restore_program() -> (NativeProgram, Vec<u32>) {
+    let mut w = vec![
+        vop2(0x25, 1, k(1), 0),  // v_add_nc_u32 v1, 1, v0
+        vopc(0xD4, k(40), 0),    // v_cmpx_gt_u32 exec, 40, v0
+        sop1(0x25, 12, k(65)),   // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0002,
+        0x0032_0280, // v_cndmask_b32 v2, 0, v1, s[12:13]
+    ];
+    for dpp in [0xDE54_C102u32, 0x9360_1202, 0x0009_2402] {
+        w.extend([vop2(0x25, 2, 0xE9, 2), dpp]); // v_add_nc_u32 v2, v2, v2 dpp8:[...]
+    }
+    w.extend([
+        vop2(0x25, 2, 0xFA, 2),
+        0xFF09_4002, // v_add_nc_u32 v2, v2, v2 row_mirror bound_ctrl:1
+        0xD778_0003,
+        0x0201_0102,             // v_permlanex16_b32 v3, v2, 0, 0
+        vop2(0x25, 2, v(3), 2),  // v_add_nc_u32 v2, v3, v2
+        0xD760_000E,
+        0x0001_0102,             // v_readlane_b32 s14, v2, 0
+        vop2(0x25, 2, 14, 2),    // v_add_nc_u32 v2, s14, v2
+        sop1(0x04, EXEC, 12),    // s_mov_b64 exec, s[12:13]
+        vopc(0xC4, k(20), 0),    // v_cmp_gt_u32 vcc, 20, v0
+        sop1(0x24, 16, VCC),     // s_and_saveexec_b64 s[16:17], vcc
+        0xD760_000F,
+        0x0001_7F02,             // v_readlane_b32 s15, v2, 63
+        vop1(0x01, 3, 15),       // v_mov_b32 v3, s15
+        vop2(0x1A, 15, k(3), 0), // v_lshlrev_b32 v15, 3, v0
+    ]);
+    w.extend(store(3, 15, 0));
+    w.extend(store(1, 15, 4));
+    let sum: u32 = (1..=40).sum();
+    let console = (0..64u32).flat_map(|t| if t < 20 { [sum, t + 1] } else { [0, 0] }).collect();
+    (native(&w), console)
+}
+
+#[test]
+fn a_lane_of_a_reduction_read_past_the_restore_is_the_consoles_sum() {
+    let (native, console) = lane_read_past_the_restore_program();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let wide = lowered_for_width(&native, &p, &HashSet::new(), 64).expect("lower for 64 lanes");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut wide.dxil.clone()).expect("DXIL validation failed");
+    }
+    let narrow = chosen_for_32_lanes(&native);
+    let pair = paired(&native);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (warp, shader, form) in [
+        (true, &wide, "64-lane waves on WARP"),
+        (false, &wide, "64-lane waves on the hardware device"),
+        (false, &narrow, "the form emit chooses for 32-lane waves"),
+        (false, &pair, "the paired form"),
+    ] {
+        match run_once(warp, shader, 64 * 2) {
+            Some(got) => {
+                if let Some(n) = (0..console.len()).find(|&n| got[n] != console[n]) {
+                    panic!("{form}: thread {}, dword {}: {:#x}, the console's {:#x}", n / 2, n % 2, got[n], console[n]);
+                }
+                eprintln!("{form}: as on the console");
+            }
+            None => eprintln!("no device that takes {form}; not run"),
+        }
+    }
+}
+
 // ---- lane masks the code sets to constant lanes ----
 
 /// One console wave of 64 threads; thread t stores t + 1 to dwords 0..7 of its sixteen (64

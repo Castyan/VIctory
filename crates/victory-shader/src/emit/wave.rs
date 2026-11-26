@@ -252,6 +252,10 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// The shapes of the values the block's `v_readlane_b32` of a constant lane past the
+    /// restore read from a value the section writes (the compiler reads lane 63 of a
+    /// reduction after restoring EXEC; a lane read does not depend on EXEC).
+    pub tail: HashMap<Value, Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -289,8 +293,25 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let body = &insts[i + 1..end];
+        // (up to the next section, whose own simulation does not follow it)
+        let tail: Vec<&Inst> = insts[end + 1..]
+            .iter()
+            .take_while(|t| !matches!(t.name(), "s_or_saveexec_b64" | "s_or_saveexec_b32" | "s_nand_saveexec_b64" | "s_nand_saveexec_b32"))
+            .filter(|t| {
+                t.name() == "v_readlane_b32"
+                    && t.reads
+                        .iter()
+                        .any(|&(r, x)| matches!(r, Reg::V(_)) && body.iter().any(|b| b.writes.iter().any(|w| w.1 == x)))
+            })
+            .collect();
+        let mut shapes = simulate(body.iter().chain(tail.iter().copied()), wave, saved);
+        let tail = tail
+            .iter()
+            .flat_map(|t| &t.writes)
+            .filter_map(|w| shapes.remove(&w.1).map(|sh| (w.1, sh)))
+            .collect();
+        out.insert(i, Section { end, shapes, tail });
         i = end + 1;
     }
     out
@@ -378,7 +399,7 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate<'a>(insts: impl IntoIterator<Item = &'a Inst>, wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
