@@ -2176,3 +2176,33 @@ fn typed_buffer_stores_of_some_channels_zero_the_others() {
     }
     assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
 }
+
+/// `v_ldexp_f32 v0, v1, v2`: v1 * 2^v2, rounded once, out to infinity and
+/// down to zero, with exponents far past a float's range.
+#[test]
+fn ldexp_scales_by_a_power_of_two_rounded_once() {
+    let shader = build_valu_cs(&vop3(0x362, 0, vgpr(1), vgpr(2), 0));
+    let cases: Vec<[u32; 4]> = [
+        (1.5f32, 3i32),
+        (1.5, -3),
+        (5.0, 0),
+        (1.0, -126),
+        (3.0, 127),
+        (-0.75, 200),
+        (f32::MAX, -280),
+        (2.0f32.powi(127), -253),
+        (1.0, -1000),
+        (1.0, 1000),
+        (-2.5, -10),
+    ]
+    .iter()
+    .map(|&(x, n)| [x.to_bits(), n as u32, 0, 0])
+    .collect();
+    run_cases(&shader, &cases, |backend, _, i, got| {
+        let (x, n) = (f32::from_bits(i[0]), i[1] as i32);
+        let want = (f64::from(x) * 2f64.powi(n.clamp(-2000, 2000))) as f32;
+        // Results below the normal range: a card may flush them to zero.
+        let flushed = want != 0.0 && want.abs() < f32::MIN_POSITIVE && f32::from_bits(got) == 0.0;
+        assert!(got == want.to_bits() || flushed, "{backend}: ldexp({x}, {n}) = {}, want {want}", f32::from_bits(got));
+    });
+}

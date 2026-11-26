@@ -7203,6 +7203,36 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_ldexp_f32" => {
+                // src0 * 2^src1 (src1 a signed integer). Three powers of two
+                // that each have a normal float form (exponents -126 to 127)
+                // cover every exponent that can move a float from or to zero,
+                // a denormal or infinity; the products round as one would.
+                let a = f(self, 0)?;
+                let n = s(self, 1)?;
+                let i32t = self.s.t.i32;
+                let clamp = |l: &mut Self, x: V, lo: i32, hi: i32| {
+                    let (lo, hi) = (l.s.m.i32(lo as u32), l.s.m.i32(hi as u32));
+                    let x = l.s.op(c, "binary.i32", Attr::ReadNone, i32t, 37, &[x, lo]);
+                    l.s.op(c, "binary.i32", Attr::ReadNone, i32t, 38, &[x, hi])
+                };
+                let pow2 = |l: &mut Self, k: V| {
+                    let (k127, k23) = (l.s.m.i32(127), l.s.m.i32(23));
+                    let e = l.s.m.bin(c, Bin::Add, k, k127);
+                    let bits = l.s.m.bin(c, Bin::Shl, e, k23);
+                    l.as_float(bits)
+                };
+                let n = clamp(self, n, -378, 381);
+                let mut rest = n;
+                let mut r = a;
+                for _ in 0..3 {
+                    let k = clamp(self, rest, -126, 127);
+                    rest = self.s.m.bin(c, Bin::Sub, rest, k);
+                    let p = pow2(self, k);
+                    r = self.s.m.bin(c, Bin::Mul, r, p);
+                }
+                float(self, r)
+            }
             "v_fma_f32" | "v_fmaak_f32" | "v_fmamk_f32" => {
                 // shortcut: DXIL has no fused f32 multiply-add; FMad lets the driver fuse.
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
