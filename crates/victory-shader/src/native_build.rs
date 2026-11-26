@@ -22,16 +22,24 @@
 //!   0x43  the program's 128-bit hash, last
 //! ```
 //!
-//! The user-data dword is the one byte that agrees across a table: every
-//! entry of root slot k names dword 4 + k, which the program's
-//! `COMPUTE_PGM_RSRC2` user-SGPR count covers, and a fixed sampler 0. The
-//! u32 before it is 0x10 or 0x20 for buffer SRVs (a structured stride),
-//! which no user-SGPR count covers.
+//! The user-data dword is the one byte that agrees across a table: the
+//! root slots take the dwords from 4 on in their order, one each but two
+//! for a root descriptor, which the program's `COMPUTE_PGM_RSRC2` user-SGPR
+//! count covers, and a fixed sampler 0. The u32 before it is 0x10 or 0x20
+//! for buffer SRVs (a structured stride), which no user-SGPR count covers.
 //!
 //! Root type 0 is root constants (resource type 2): the program reads them
 //! as values straight from its user SGPRs (`v_mul_f32 v7, s5, v7`), so the
 //! descriptor dwords byte is their size in bytes. They give a root parameter
 //! and no used resource, as nothing is loaded through them.
+//!
+//! Root type 1 is a root descriptor, a 64-bit buffer address in two user
+//! SGPRs (descriptor dwords 2). Seen as an SRV (`t1`, user data 7 and 8,
+//! the next slot at 9), which the program makes a buffer descriptor around
+//! and loads through: `s_mov_b32 s20, s7`, `s_mov_b32 s21, s8`,
+//! `s_mov_b32 s22, -1`, `s_mov_b32 s23, 0x31016fac`, then
+//! `s_buffer_load_dword s27, s[20:23], null`. It is a root parameter of two
+//! SGPRs and a used resource, as the title's containers give one.
 //!
 //! The registers of a compute program, 0x1c bytes: u32 flags (bit 5: 32
 //! lanes, as the container record's flags), u32, u32, u16 x3 thread-group
@@ -111,6 +119,7 @@ fn resources(table: &[u8]) -> Result<(Vec<RootParam>, Vec<UsedResource>), Shader
         });
         let sgprs = match root {
             RootType::Table => 1,
+            RootType::Descriptor => 2,
             RootType::ImmediateSampler => 0,
             _ => {
                 return Err(Malformed(
@@ -498,6 +507,69 @@ mod tests {
                 slot: 1,
             }
         );
+    }
+
+    /// As a title's table: a table in dword 4, a root SRV (t1) in dwords 5
+    /// and 6, its 64-bit address, then a root constant in dword 7 (slot 2:
+    /// the root SRV's two dwords push it one past 4 + 2).
+    #[test]
+    fn a_root_descriptor_takes_two_user_data_dwords() {
+        let mut t = Vec::new();
+        for w in [0x403u32, 0, 0, 0, 0, 3 << 16 | 0x440] {
+            t.extend(w.to_le_bytes());
+        }
+        let mut entry = |words: [u32; 8]| t.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        entry([0x41, 0x303, 0, 7, 4, 0x408, u32::MAX, 0]);
+        entry([0x41, 0x100, 0, 1, 0, 1 << 16 | 0x502, u32::MAX, 0]);
+        entry([0x41, 0x002, 0, 0x1f6, 0, 2 << 16 | 0x704, u32::MAX, 0]);
+        entry([0x42, 0, 0xa_0101, 7, 0, 0, u32::MAX, 0]);
+        entry([0x43, 1, 2, 3, 4, 0, 0, 0]);
+        let size = (t.len() - 0x14) as u32;
+        t[4..8].copy_from_slice(&size.to_le_bytes());
+        let mut regs = registers();
+        regs[0x18..0x1c].copy_from_slice(&(8u32 << 1).to_le_bytes());
+        let code = 0xBF81_0000u32.to_le_bytes();
+        let p = console_compute(&regs, &t, &code).unwrap();
+        assert_eq!(
+            p.layout[1],
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 1,
+                user_data: 5,
+                slot: 1,
+            }
+        );
+        assert_eq!(
+            p.used[1],
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 1,
+                stride: 0,
+                dwords: 2,
+                user_data: 5,
+                slot: 1,
+            }
+        );
+        assert_eq!(p.used.len(), 2, "constants are not a resource read");
+        let c = compute_container(&p).unwrap();
+        let c = crate::Container::parse(&c).unwrap();
+        assert_eq!(
+            super::super::native_programs(c.part(FourCC::DXIL).unwrap().data).unwrap(),
+            vec![p]
+        );
+        // Six user SGPRs hold the address's low half only (without the
+        // constant, the root SRV the last entry).
+        regs[0x18..0x1c].copy_from_slice(&(6u32 << 1).to_le_bytes());
+        t.drain(0x58..0x78);
+        let size = (t.len() - 0x14) as u32;
+        t[4..8].copy_from_slice(&size.to_le_bytes());
+        assert!(console_compute(&regs, &t, &code).is_err());
+        regs[0x18..0x1c].copy_from_slice(&(7u32 << 1).to_le_bytes());
+        assert!(console_compute(&regs, &t, &code).is_ok());
     }
 
     #[test]
