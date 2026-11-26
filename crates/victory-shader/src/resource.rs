@@ -1148,12 +1148,16 @@ impl<'a> Tracer<'a> {
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
         self.raw.set(false);
         let source = self.classify(&words, &mut Vec::new(), &mut known)?;
-        // A structured buffer made raw has no stride and no format: an index
-        // would add nothing and a format read would read a raw dword, where
-        // the load's descriptor would not.
+        // A structured buffer made raw has no stride and its format is the
+        // load's: an index would add nothing, where the load's descriptor
+        // would scale it, and a format read would take the format the load's
+        // descriptor says. A typed read (`tbuffer_load_format_*`) names its
+        // own format: by byte, it reads what the load's raw view holds there.
         if self.raw.get() {
             let by_byte = match inst.fields {
-                Fields::Buffer { idxen, .. } => !idxen && !inst.name().contains("format"),
+                Fields::Buffer { idxen, format, .. } => {
+                    !idxen && (format.is_some() || !inst.name().contains("format"))
+                }
                 Fields::Smem { .. } => true,
                 _ => false,
             };
@@ -3008,19 +3012,24 @@ pub(crate) mod tests {
 
     const MUL_BY_STRIDE: u32 = 0x9306_0806; // s_mul_i32 s6, s6, s8
     const BY_BYTE: [u32; 2] = [0xE030_1034, 0x8001_0100]; // buffer_load_dword v1, v0, s[4:7], 0 offen offset:52
+    /// `tbuffer_load_format_xy v[1:2], v0, s[4:7], 0 offen format:[BUF_FMT_16_16_SNORM]`, as
+    /// the title's 0x218 programs read the buffer they make raw (`slot218-m093` at 0x1e94).
+    const TYPED_BY_BYTE: [u32; 2] = [0xE8C1_1000, 0x8001_0100];
 
     #[test]
     fn a_structured_buffer_made_raw_is_its_load() {
-        let code = made_raw(MUL_BY_STRIDE, BY_BYTE);
-        let r = track_words(&code, &[param(Table, 9, 1)], HwStage::Ps);
-        assert_eq!(r.scalar, [((0, 2), at(0, 0))]);
-        assert_eq!(
-            r.descriptors[0].source,
-            Source::Loaded {
-                load: (0, 2),
-                first: 0
-            }
-        );
+        for last in [BY_BYTE, TYPED_BY_BYTE] {
+            let code = made_raw(MUL_BY_STRIDE, last);
+            let r = track_words(&code, &[param(Table, 9, 1)], HwStage::Ps);
+            assert_eq!(r.scalar, [((0, 2), at(0, 0))]);
+            assert_eq!(
+                r.descriptors[0].source,
+                Source::Loaded {
+                    load: (0, 2),
+                    first: 0
+                }
+            );
+        }
     }
 
     #[test]
@@ -3034,6 +3043,15 @@ pub(crate) mod tests {
         let by_index = [0xE030_2000, 0x8001_0100]; // buffer_load_dword v1, v0, s[4:7], 0 idxen
         assert_eq!(
             fails(made_raw(MUL_BY_STRIDE, by_index)),
+            ShaderError::Unsupported {
+                offset: 0x38,
+                what: "a structured buffer made raw, read by index or format"
+            }
+        );
+        // A format read takes the descriptor's format, which is the load's.
+        let by_format = [0xE004_1000, 0x8001_0100]; // buffer_load_format_xy v[1:2], v0, s[4:7], 0 offen
+        assert_eq!(
+            fails(made_raw(MUL_BY_STRIDE, by_format)),
             ShaderError::Unsupported {
                 offset: 0x38,
                 what: "a structured buffer made raw, read by index or format"
