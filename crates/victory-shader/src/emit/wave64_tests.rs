@@ -1298,3 +1298,97 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+/// The thread-group info SGPR (s6 after 5 user SGPRs and the group's number in x) as the
+/// 0x218 programs read it (`slot218-m001` at 0xa4, `m020` at 0x68): `s_and_b32 s10, s6,
+/// 0xfc0`, the wave's index times 64, then `v_mbcnt_lo/hi(-1, s10)`, the thread's index in the
+/// group. Each thread stores that (or, without `mbcnt`, its thread index), the wave count
+/// (bits 0-5) and the low 12 bits; each form the host may get matches the console's waves of
+/// `wave` lanes taking the flat ids in order.
+fn group_info_program(wave64: bool, threads: u32, mbcnt: bool) -> NativeProgram {
+    let mut w = vec![sop2(0x0E, 12, 6, LIT), 0xFC0]; // s_and_b32 s12, s6, 0xfc0
+    if mbcnt {
+        w.extend(vop3(0x365, 1, k(65), 12)); // v_mbcnt_lo_u32_b32 v1, -1, s12
+        w.extend(vop3(0x366, 1, k(65), v(1))); // v_mbcnt_hi_u32_b32 v1, -1, v1
+    } else {
+        w.push(vop1(0x01, 1, v(0))); // v_mov_b32 v1, v0 (the thread index)
+    }
+    w.extend([
+        sop2(0x0E, 13, 6, k(63)), // s_and_b32 s13, s6, 63
+        sop2(0x0E, 14, 6, LIT),   // s_and_b32 s14, s6, 0xfff
+        0xFFF,
+        vop1(0x01, 2, 13), // v_mov_b32 v2, s13
+        vop1(0x01, 3, 14), // v_mov_b32 v3, s14
+        vop1(0x01, 4, 12), // v_mov_b32 v4, s12
+    ]);
+    w.extend(stores([1, 2, 3, 4]));
+    let mut native = native_with(&w, wave64, threads, 0);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 7 | 1 << 10; // the group's number in x (s5), the group info (s6)
+    }
+    native
+}
+
+/// The console's: thread t's [index in the group as the program computes it, wave count,
+/// low 12 bits, wave index * 64].
+fn group_info_console(wave: u32, threads: u32, mbcnt: bool) -> Vec<u32> {
+    let waves = threads.div_ceil(wave);
+    (0..threads)
+        .flat_map(|t| {
+            let base = (t / wave) << 6;
+            let index = if mbcnt { base + t % wave } else { t };
+            [index, waves, base | waves, base]
+        })
+        .collect()
+}
+
+#[test]
+fn the_group_info_sgpr_is_the_consoles_wave_index_and_count() {
+    let lower_at = |native: &NativeProgram, host_wave: u32| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = lowered_for_width(native, &p, &HashSet::new(), host_wave).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+        shader
+    };
+    let mut forms = vec![
+        // one host wave of 32 for each console wave of 64
+        ("paired", paired(&group_info_program(true, 192, true)), 64, 192, true),
+        // two host waves of 32 for each console wave of 64, exchanging through LDS
+        ("halves", lower_at(&group_info_program(true, 192, true), 32), 64, 192, true),
+        // host waves of 64 (a device that takes them)
+        ("64 lanes", lower_at(&group_info_program(true, 192, true), 64), 64, 192, true),
+        // a console of 32-lane waves, the last one partial
+        ("wave32", lower_at(&group_info_program(false, 100, true), 32), 32, 100, true),
+    ];
+    // no lane operation: the host's thread ids, whatever its waves
+    for (name, wave64, threads) in [("no lanes, wave64", true, 192), ("no lanes, wave32", false, 100)] {
+        let wave = if wave64 { 64 } else { 32 };
+        forms.push((name, lower_at(&group_info_program(wave64, threads, false), 32), wave, threads, false));
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (name, shader, wave, threads, mbcnt) in &forms {
+        let Some(got) = run_paired(shader, [0; 4], 4 * threads) else { continue };
+        eprintln!("{name}: ran on the hardware device");
+        same_as_console(&got, &group_info_console(*wave, *threads, *mbcnt));
+    }
+}
+
+/// Bits above 11 of the group info SGPR are not known: a read that keeps them is refused.
+#[test]
+fn the_group_info_sgpr_read_whole_is_refused() {
+    for (first, mask) in [(sop1(0x03, 12, 6), None), (sop2(0x0E, 12, 6, LIT), Some(0x1FC0))] {
+        let mut w = vec![first];
+        w.extend(mask);
+        w.push(vop1(0x01, 1, 12));
+        w.extend(stores([1, 1, 1, 1]));
+        let mut native = native_with(&w, true, 64, 0);
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= 1 << 7 | 1 << 10;
+        }
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let err = lowered_for_width(&native, &p, &HashSet::new(), 32).map(|_| ()).expect_err("refused");
+        assert!(err.to_string().contains("thread-group info SGPR read past"), "{err}");
+    }
+}

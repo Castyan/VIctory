@@ -2486,7 +2486,7 @@ impl<'a> Lower<'a> {
                 let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, id, base));
             }
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::GroupInfo => return self.group_info(),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -4526,6 +4526,53 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
         }
         Ok(())
+    }
+
+    /// Compute: the thread-group info SGPR (`COMPUTE_PGM_RSRC2.TG_SIZE_EN`): the group's wave
+    /// count in bits 0-5 and the wave's index in the group in bits 6-11 (where ACO reads its
+    /// `num_subgroups` and `subgroup_id`). The index is that of the console wave holding the
+    /// thread whose ids the program gets ([`Self::thread_id`]): its flat id over the console
+    /// wave size, as the console's waves take the flat ids in order. With console lanes that
+    /// thread's lane numbers (`v_mbcnt`, [`Self::console_lane`]) are its flat id's low bits, so
+    /// index * 64 + lane is its flat id as on the console. What the console holds above bit 11
+    /// is not known: only reads that mask it off (`s_and_b32` with a mask below 0x1000).
+    fn group_info(&mut self) -> Val {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return Val::Missing("the thread-group info SGPR outside compute");
+        };
+        let info: Vec<Value> = (self.x.io.inputs.iter())
+            .filter(|(_, i)| *i == Input::GroupInfo)
+            .map(|(v, _)| *v)
+            .collect();
+        let masked = |i: &Inst| {
+            i.name() == "s_and_b32"
+                && matches!(&i.fields, Fields::Sop { src, .. } if src.iter().any(|o| match *o {
+                    Operand::Literal(m) => m < 0x1000,
+                    Operand::Const(k) => (128..=192).contains(&k),
+                    _ => false,
+                }))
+        };
+        for b in &self.x.p.blocks {
+            if b.phis.iter().any(|p| p.args.iter().any(|a| info.contains(a)))
+                || b.insts.iter().any(|i| i.reads.iter().any(|r| info.contains(&r.1)) && !masked(i))
+            {
+                return Val::Missing("the thread-group info SGPR read past its wave index and count");
+            }
+        }
+        let e = self.s.entry;
+        let flat = if self.console_lanes {
+            self.console_thread()
+        } else {
+            let i32t = self.s.t.i32;
+            self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[])
+        };
+        let wave = self.wave();
+        let shift = self.s.m.i32(wave.trailing_zeros());
+        let index = self.s.m.bin(e, Bin::LShr, flat, shift);
+        let k6 = self.s.m.i32(6);
+        let index = self.s.m.bin(e, Bin::Shl, index, k6);
+        let count = self.s.m.i32(cs.threads.iter().product::<u32>().div_ceil(wave));
+        Val::I32(self.s.m.bin(e, Bin::Or, index, count))
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
