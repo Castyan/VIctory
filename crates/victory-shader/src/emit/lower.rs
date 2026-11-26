@@ -337,6 +337,9 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// The lane reads past a section's restore that take their value from its
+    /// [`super::wave::Section::tail`]: (block, index) to the section's start.
+    section_tail: HashMap<(usize, usize), usize>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1550,6 +1553,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            section_tail: HashMap::new(),
             code_table: None,
             counters: HashMap::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
@@ -1782,6 +1786,14 @@ impl<'a> Lower<'a> {
                         inside.insert(w, (b, start, sec.end));
                     }
                 }
+                for (i, inst) in p.blocks[b].insts.iter().enumerate().skip(sec.end + 1) {
+                    if inst.writes.iter().any(|w| sec.tail.contains_key(&w.1)) {
+                        self.section_tail.insert((b, i), start);
+                        for &(_, w) in &inst.writes {
+                            inside.insert(w, (b, start, sec.end));
+                        }
+                    }
+                }
             }
             if !found.is_empty() {
                 self.sections.insert(b, found);
@@ -1814,7 +1826,8 @@ impl<'a> Lower<'a> {
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
-                let shape = self.sections[&b][&start].shapes.get(&w).copied();
+                let sec = &self.sections[&b][&start];
+                let shape = sec.shapes.get(&w).or(sec.tail.get(&w)).copied();
                 let own = self.own_bits.totals.contains(&w);
                 match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh, own)) {
                     Ok(x) => Val::I32(x),
@@ -1834,8 +1847,9 @@ impl<'a> Lower<'a> {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
+            let sec = &self.sections[&b][&start];
             let shape = match self.section_out.contains(&w) {
-                true => self.sections[&b][&start].shapes.get(&w).copied(),
+                true => sec.shapes.get(&w).or(sec.tail.get(&w)).copied(),
                 false => None,
             };
             let made = match shape {
@@ -2309,6 +2323,15 @@ impl<'a> Lower<'a> {
             self.lds_last = None;
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                if let Some(&start) = self.section_tail.get(&(b, i)) {
+                    if self.twin.is_some() {
+                        self.paired_section_inst(b, i, start);
+                    } else {
+                        self.section_inst(b, i, start);
+                    }
+                    i += 1;
+                    continue;
+                }
                 if self.twin.is_some() {
                     self.paired_inst(b, i)?;
                 } else {
