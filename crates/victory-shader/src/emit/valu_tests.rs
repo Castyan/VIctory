@@ -2206,3 +2206,39 @@ fn ldexp_scales_by_a_power_of_two_rounded_once() {
         assert!(got == want.to_bits() || flushed, "{backend}: ldexp({x}, {n}) = {}, want {want}", f32::from_bits(got));
     });
 }
+
+/// `s_sext_i32_i8` and `s_sext_i32_i16`: the low byte or word of s0,
+/// sign-extended; SCC (set from s1 beforehand) stays as it was.
+#[test]
+fn scalar_sign_extensions_take_the_low_bits_and_keep_scc() {
+    const SRC_SCC: u8 = 253;
+    // SOP1 `op sdst, src0`.
+    const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+        0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
+    }
+    let s_cmp_lg_s1_0 = 0xBF07_8001; // s_cmp_lg_u32 s1, 0
+    let cases: [(u8, fn(u32) -> u32); 2] = [(0x19, |a| a as u8 as i8 as i32 as u32), (0x1a, |a| a as u16 as i16 as i32 as u32)];
+    let inputs = [
+        [0, 0, 0, 0],
+        [0x7F, 1, 0, 0],
+        [0x80, 0, 0, 0],
+        [0x7FFF, 1, 0, 0],
+        [0x8000, 0, 0, 0],
+        [0xFFFF, 1, 0, 0],
+        [0x1234_5678, 0, 0, 0],
+        [0xFFFF_00FF, 1, 0, 0],
+        [0x0001_8001, 0, 0, 0],
+    ];
+    for (op, expected) in cases {
+        let value = [s_cmp_lg_s1_0, sop1(op, 6, 0), vop1(0x001, 0, sgpr(6))];
+        let scc = [s_cmp_lg_s1_0, sop1(op, 6, 0), vop1(0x001, 0, u16::from(SRC_SCC))];
+        let shader = build_valu_cs(&value);
+        run_cases(&shader, &inputs, |backend, _, i, got| {
+            assert_eq!(got, expected(i[0]), "{backend}: sop1 {op:#x} of {:#x}", i[0]);
+        });
+        let shader = build_valu_cs(&scc);
+        run_cases(&shader, &inputs, |backend, _, i, got| {
+            assert_eq!(got, u32::from(i[1] != 0), "{backend}: SCC after sop1 {op:#x} with {i:x?}");
+        });
+    }
+}
