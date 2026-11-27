@@ -295,15 +295,14 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             insts[j].write(Reg::S(EXEC)).is_some()
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
-        // With no restore, the section ends where EXEC becomes what the simulation does not
-        // follow (0x218 m128 leaves its second section with `s_mov_b64 exec, s[12:13]`, lane 0
-        // alone, which stores the result): the code after it is lowered under that EXEC as
-        // anywhere else.
+        // With no restore, the section ends at its next EXEC write (0x218 m128 leaves its
+        // second section with `s_mov_b64 exec, s[12:13]`, lane 0 alone, which stores the
+        // result; `2bb44e9a9a710ad2` with `s_mov_b64 exec, 1`, then works and stores in lane 0
+        // alone): the code after it is lowered under that EXEC as anywhere else.
         let end = restore.or_else(|| {
             (i + 1..insts.len()).find(|&j| {
                 let t = &insts[j];
-                (t.write(Reg::S(EXEC)).is_some() || t.write(Reg::S(EXEC + 1)).is_some())
-                    && !(t.name().starts_with("s_mov_b") && constant(t).is_some())
+                t.write(Reg::S(EXEC)).is_some() || t.write(Reg::S(EXEC + 1)).is_some()
             })
         });
         let Some(end) = end else {

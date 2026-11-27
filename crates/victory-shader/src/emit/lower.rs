@@ -1187,6 +1187,18 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     partners
 }
 
+/// Whether `inst` does something besides writing registers: memory, an export, a barrier.
+fn has_effect(inst: &Inst) -> bool {
+    let name = inst.name();
+    matches!(inst.fields, Fields::Exp { .. })
+        || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+        || name.contains("store")
+        || name.contains("atomic")
+        || name == "s_barrier"
+        || matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_read") || name.starts_with("ds_swizzle") || name.contains("permute"))
+}
+
 /// A scalar ALU instruction that neither reads nor writes EXEC: inside a whole-wave section
 /// it does not depend on the lanes, so it is lowered as anywhere else (0x218 program
 /// `2de0c233d150046c` shifts a lane read of a reduction there, `s_lshr_b32 s39, s37, 5`, and
@@ -2359,8 +2371,14 @@ impl<'a> Lower<'a> {
                 }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
+                        // (a section stands for the values it leaves: what it does
+                        // besides would be lost)
+                        let t = &p.blocks[b].insts[j];
+                        if has_effect(t) {
+                            return Err(unsupported(t.machine.offset, "a side effect inside a whole-wave section"));
+                        }
                         // (scalar work beside the lanes: lowered as anywhere else)
-                        if plain_scalar(&p.blocks[b].insts[j]) {
+                        if plain_scalar(t) {
                             if self.twin.is_some() {
                                 self.paired_inst(b, j)?;
                             } else {
@@ -5309,15 +5327,7 @@ impl<'a> Lower<'a> {
             // each host wave answers for itself.
             MaskData::None => self.uniform_test(inst),
         };
-        let effect = matches!(inst.fields, Fields::Exp { .. })
-            || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
-            || name.contains("store")
-            || name.contains("atomic")
-            || name == "s_barrier"
-            || matches!(inst.fields, Fields::Ds { .. })
-                && !(name.starts_with("ds_read")
-                    || name.starts_with("ds_swizzle")
-                    || name.contains("permute"));
+        let effect = has_effect(inst);
         if self.split_lds
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))

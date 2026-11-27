@@ -1954,3 +1954,32 @@ fn scalar_work_inside_a_whole_wave_section_takes_the_sections_value() {
     same_as_console(&got, &want);
     eprintln!("ran on the hardware device: the section's scalar work as on the console");
 }
+
+/// A whole-wave section with no restore (the wave OR of `super::wave::WAVE_OR_V7_TO_S7`), left
+/// with `s_mov_b64 exec, 1`, lane 0 alone, which stores the OR (0x218 program
+/// `2bb44e9a9a710ad2`: lane 0 then works and stores past such a section), and EXEC is set
+/// again later from a copy made before the section. The section ends at the constant write
+/// (it took the store in, and lost it, up to the later write); thread 0 stores the OR of every
+/// lane's bit, the other threads nothing.
+#[test]
+fn a_section_left_for_lane_0_alone_by_a_constant_exec_ends_there() {
+    let mut w = vec![
+        vop2(0x16, 3, k(1), 0), // v_lshrrev_b32 v3, 1, v0
+        vop1(0x01, 6, k(1)),    // v_mov_b32 v6, 1
+        vop2(0x1A, 7, v(3), 6), // v_lshlrev_b32 v7, v3, v6: 1 << (t >> 1)
+        sop1(0x04, 2, EXEC),    // s_mov_b64 s[2:3], exec
+    ];
+    let section = super::wave::WAVE_OR_V7_TO_S7;
+    w.extend_from_slice(&section[..section.len() - 1]);
+    w.push(sop1(0x04, EXEC, k(1))); // s_mov_b64 exec, 1
+    w.push(vop1(0x01, 9, 7)); // v_mov_b32 v9, s7
+    w.extend(stores([9, 9, 9, 9]));
+    w.push(sop1(0x04, EXEC, 2)); // s_mov_b64 exec, s[2:3]: EXEC again, but not the section's
+    let shader = paired(&native_with(&w, true, 64, 256));
+    let mut want = vec![0u32; 256];
+    want[..4].fill(u32::MAX);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 256) else { return };
+    same_as_console(&got, &want);
+    eprintln!("ran on the hardware device: lane 0 alone past the section, as on the console");
+}
