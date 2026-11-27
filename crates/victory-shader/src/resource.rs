@@ -520,7 +520,7 @@ impl<'a> Tracer<'a> {
                         let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => Some(Term::Value(v)),
+                            None => self.xor_swapped(inst, k, &o).or(Some(Term::Value(v))),
                         };
                         if new.is_some() && new != o[v.0 as usize] {
                             o[v.0 as usize] = new;
@@ -540,6 +540,27 @@ impl<'a> Tracer<'a> {
         Err(ShaderError::Unsupported {
             offset: 0,
             what: "copies that do not settle",
+        })
+    }
+
+    /// Dword `k` of `inst` as `(p ^ q) ^ q`, which is `p`: the register swap compilers write as
+    /// three XORs (`s_xor a, a, b; s_xor b, a, b; s_xor a, a, b`, the 0x218 programs'
+    /// descriptors). `o` holds the origins found so far.
+    fn xor_swapped(&self, inst: &Inst, k: usize, o: &[Option<Term>]) -> Option<Term> {
+        let [a, b] = xor_operands(inst, k)?;
+        let (ta, tb) = (o[a.0 as usize]?, o[b.0 as usize]?);
+        [(ta, tb), (tb, ta)].into_iter().find_map(|(x, y)| {
+            let Term::Value(x) = x else { return None };
+            let def = self.def(x)?;
+            let [p, q] = xor_operands(def, def.writes.iter().position(|w| w.1 == x)?)?;
+            let (tp, tq) = (o[p.0 as usize]?, o[q.0 as usize]?);
+            if tq == y {
+                Some(tp)
+            } else if tp == y {
+                Some(tq)
+            } else {
+                None
+            }
         })
     }
 
@@ -2436,6 +2457,21 @@ fn constant_operand(op: Operand) -> Option<u32> {
     }
 }
 
+/// The two values dword `k` of an `s_xor_b32` or `s_xor_b64` result is the XOR of.
+fn xor_operands(inst: &Inst, k: usize) -> Option<[Value; 2]> {
+    if !(inst.name() == "s_xor_b32" && k == 0 || inst.name() == "s_xor_b64" && k < 2) {
+        return None;
+    }
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    let read = |op: &Operand| match *op {
+        Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code + k as u8)),
+        _ => None,
+    };
+    Some([read(src.first()?)?, read(src.get(1)?)?])
+}
+
 /// What dword `k` of a move's result copies.
 fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     let Fields::Sop { src, imm, .. } = &inst.fields else {
@@ -2541,6 +2577,37 @@ pub(crate) mod tests {
             offset,
             dynamic: None,
         }
+    }
+
+    /// A descriptor dword swapped away and back by three XORs each way (the 0x218 programs'
+    /// register shuffles, `m103` at 0x1bac) is still the loaded dword.
+    #[test]
+    fn a_descriptor_swapped_by_xors_is_still_the_loaded_one() {
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0204,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[8:9], null
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0xBE8C_0380, // s_mov_b32 s12, 0
+                0x8900_0C00, // s_xor_b32 s0, s0, s12
+                0x890C_0C00, // s_xor_b32 s12, s0, s12
+                0x8900_0C00, // s_xor_b32 s0, s0, s12   (s0 = 0, s12 = the dword)
+                0x8900_0C00, // s_xor_b32 s0, s0, s12
+                0x890C_0C00, // s_xor_b32 s12, s0, s12
+                0x8900_0C00, // s_xor_b32 s0, s0, s12   (back)
+                0xF080_0F08,
+                0x0040_0002, // image_sample v[0:3], v[2:3], s[0:7], s[8:11]
+                S_ENDPGM,
+            ],
+            &[param(Table, 8, 1), param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r.scalar, [((0, 3), at(0, 0)), ((0, 4), at(1, 0))]);
+        assert!(r.descriptors.iter().all(|d| matches!(d.source, Source::Loaded { .. })), "{:?}", r.descriptors);
     }
 
     #[test]
