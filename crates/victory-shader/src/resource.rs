@@ -1540,10 +1540,20 @@ impl<'a> Tracer<'a> {
         self.read_first_lane.set(true);
         let address = self.smem_address(inst, base, *offset, soffset);
         self.read_first_lane.set(false);
-        match self.origin(address.ok()?.dynamic?) {
-            Term::Value(v) if self.first_lane_source(v).is_some() => Some(v),
-            _ => None,
+        let Term::Value(mut v) = self.origin(address.ok()?.dynamic?) else {
+            return None;
+        };
+        // A table of records wider than a dword: the read shifted by a constant
+        // (`s_lshl_b32 s11, s11, 5`).
+        if let Some(shl) = self.def(v)
+            && shl.name() == "s_lshl_b32"
+            && let Fields::Sop { src, .. } = &shl.fields
+            && let [Operand::Scalar { code, .. }, Operand::Const(_) | Operand::Literal(_)] = src.as_slice()
+            && let Some(Term::Value(x)) = shl.read(Reg::S(*code)).map(|x| self.origin(x))
+        {
+            v = x;
         }
+        self.first_lane_source(v).is_some().then_some(v)
     }
 
     /// Whether the descriptor operand `op` of `inst` is one the code keeps
@@ -1984,8 +1994,15 @@ impl<'a> Tracer<'a> {
         let block = &self.p.blocks[b];
         let lanes = self.lanes.ok_or(LOOP)?;
         let exit = block.insts.last().ok_or(LOOP)?;
+        // `s_cbranch_scc1` on the SCC an `_wrexec` just left ("the EXEC it writes is not
+        // empty") is `s_cbranch_execnz` on that EXEC.
+        let wrexec = block.insts.iter().rev().nth(1).filter(|w| {
+            exit.name() == "s_cbranch_scc1"
+                && w.name().contains("_wrexec_")
+                && w.write(Reg::Scc).is_some_and(|s| exit.read(Reg::Scc) == Some(s))
+        });
         if !matches!(block.exit, Exit::Branch { taken, not_taken } if taken == b && not_taken != b)
-            || exit.name() != "s_cbranch_execnz"
+            || (exit.name() != "s_cbranch_execnz" && wrexec.is_none())
         {
             return Err(LOOP);
         }
@@ -2003,14 +2020,22 @@ impl<'a> Tracer<'a> {
         {
             return Err(SPLIT);
         }
-        let selected = exec(&block.insts[access]).ok_or(SELECT)?;
-        if accesses
-            .iter()
-            .any(|&i| exec(&block.insts[i]) != Some(selected))
+        // A scalar access reads no EXEC: the lanes it serves are EXEC where it stands.
+        let exec_at = |i: usize| {
+            let pick = |x: &Inst, r| x.write(r).or_else(|| x.read(r));
+            let x = block.insts[..=i].iter().rev().find(|x| pick(x, Reg::S(EXEC)).is_some())?;
+            mask(pick(x, Reg::S(EXEC)), pick(x, Reg::S(EXEC + 1)))
+        };
+        let selected = exec_at(access).ok_or(SELECT)?;
+        if accesses.iter().any(|&i| exec_at(i) != Some(selected))
         {
             return Err(SELECT);
         }
-        let retry = exec(exit).ok_or(RETRY)?;
+        let retry = match wrexec {
+            Some(w) => mask(w.write(Reg::S(EXEC)), w.write(Reg::S(EXEC + 1))),
+            None => exec(exit),
+        }
+        .ok_or(RETRY)?;
         let first = self.defs[reads[0].0 as usize].ok_or(LOOP)?;
         let remaining = exec(self.inst(first)).ok_or(SELECT)?;
         if reads.iter().any(|v| {
