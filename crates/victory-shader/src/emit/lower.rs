@@ -5816,6 +5816,13 @@ impl<'a> Lower<'a> {
         let (r, carry): (V, Option<V>) = match name {
             "s_mov_b32" => (src32(self, 0)?, None),
             "s_movk_i32" => (sext16(self), None),
+            "s_cmovk_i32" => {
+                // The immediate where SCC is set, else the destination's old value.
+                let cond = self.scc_in(inst)?;
+                let d = dst.as_ref().ok_or("a missing operand")?;
+                let (k, old) = (sext16(self), self.operand(inst, d)?);
+                (self.s.m.select(c, cond, k, old), None)
+            }
             "s_cselect_b32" => {
                 let cond = self.scc_in(inst)?;
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
