@@ -153,6 +153,13 @@ fn inline_f16(c: u8) -> u32 {
     ][usize::from(c - 240)]
 }
 
+/// Whether `inst` is an unsigned 32-bit addition or subtraction whose clamp bit saturates it
+/// (`Lower::integer` does), without SDWA or DPP around it.
+fn saturates(inst: &Inst) -> bool {
+    matches!(&inst.fields, Fields::Valu(v) if v.clamp && v.sdwa.is_none() && v.dpp.is_none())
+        && matches!(inst.name(), "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
     Unorm,
@@ -2518,7 +2525,7 @@ impl<'a> Lower<'a> {
                 let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, id, base));
             }
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::GroupInfo => return self.group_info(),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -4364,7 +4371,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        if v.clamp && !saturates(inst) || v.omod != 0 {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -4568,6 +4575,53 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
         }
         Ok(())
+    }
+
+    /// Compute: the thread-group info SGPR (`COMPUTE_PGM_RSRC2.TG_SIZE_EN`): the group's wave
+    /// count in bits 0-5 and the wave's index in the group in bits 6-11 (where ACO reads its
+    /// `num_subgroups` and `subgroup_id`). The index is that of the console wave holding the
+    /// thread whose ids the program gets ([`Self::thread_id`]): its flat id over the console
+    /// wave size, as the console's waves take the flat ids in order. With console lanes that
+    /// thread's lane numbers (`v_mbcnt`, [`Self::console_lane`]) are its flat id's low bits, so
+    /// index * 64 + lane is its flat id as on the console. What the console holds above bit 11
+    /// is not known: only reads that mask it off (`s_and_b32` with a mask below 0x1000).
+    fn group_info(&mut self) -> Val {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return Val::Missing("the thread-group info SGPR outside compute");
+        };
+        let info: Vec<Value> = (self.x.io.inputs.iter())
+            .filter(|(_, i)| *i == Input::GroupInfo)
+            .map(|(v, _)| *v)
+            .collect();
+        let masked = |i: &Inst| {
+            i.name() == "s_and_b32"
+                && matches!(&i.fields, Fields::Sop { src, .. } if src.iter().any(|o| match *o {
+                    Operand::Literal(m) => m < 0x1000,
+                    Operand::Const(k) => (128..=192).contains(&k),
+                    _ => false,
+                }))
+        };
+        for b in &self.x.p.blocks {
+            if b.phis.iter().any(|p| p.args.iter().any(|a| info.contains(a)))
+                || b.insts.iter().any(|i| i.reads.iter().any(|r| info.contains(&r.1)) && !masked(i))
+            {
+                return Val::Missing("the thread-group info SGPR read past its wave index and count");
+            }
+        }
+        let e = self.s.entry;
+        let flat = if self.console_lanes {
+            self.console_thread()
+        } else {
+            let i32t = self.s.t.i32;
+            self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[])
+        };
+        let wave = self.wave();
+        let shift = self.s.m.i32(wave.trailing_zeros());
+        let index = self.s.m.bin(e, Bin::LShr, flat, shift);
+        let k6 = self.s.m.i32(6);
+        let index = self.s.m.bin(e, Bin::Shl, index, k6);
+        let count = self.s.m.i32(cs.threads.iter().product::<u32>().div_ceil(wave));
+        Val::I32(self.s.m.bin(e, Bin::Or, index, count))
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
@@ -5804,6 +5858,13 @@ impl<'a> Lower<'a> {
         let (r, carry): (V, Option<V>) = match name {
             "s_mov_b32" => (src32(self, 0)?, None),
             "s_movk_i32" => (sext16(self), None),
+            "s_cmovk_i32" => {
+                // The immediate where SCC is set, else the destination's old value.
+                let cond = self.scc_in(inst)?;
+                let d = dst.as_ref().ok_or("a missing operand")?;
+                let (k, old) = (sext16(self), self.operand(inst, d)?);
+                (self.s.m.select(c, cond, k, old), None)
+            }
             "s_cselect_b32" => {
                 let cond = self.scc_in(inst)?;
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -5820,6 +5881,13 @@ impl<'a> Lower<'a> {
                 let a = src32(self, 0)?;
                 let ones = self.s.m.i32(u32::MAX);
                 (self.s.m.bin(c, Bin::Xor, a, ones), None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                // The low byte or word, sign-extended (SCC is left alone).
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name == "s_sext_i32_i8" { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, t, k), None)
             }
             "s_add_u32" | "s_add_i32" | "s_addk_i32" => {
                 let a = src32(self, 0)?;
@@ -5934,8 +6002,13 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.cmp(c, p, a, b);
                 (self.s.m.select(c, t, a, b), None)
             }
-            "s_abs_i32" => {
-                let a = src32(self, 0)?;
+            "s_abs_i32" | "s_absdiff_i32" => {
+                // |src0| or |src0 - src1|, wrapping (i32::MIN stays i32::MIN); SCC = result != 0.
+                let mut a = src32(self, 0)?;
+                if name == "s_absdiff_i32" {
+                    let b = src32(self, 1)?;
+                    a = self.s.m.bin(c, Bin::Sub, a, b);
+                }
                 let z = self.s.m.i32(0);
                 let neg = self.s.m.cmp(c, pred::SLT, a, z);
                 let n = self.s.m.bin(c, Bin::Sub, z, a);
@@ -8472,12 +8545,103 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// `v_pk_fmac_f16` (VOP2): each half of the destination becomes
+    /// `S0 * S1 + D` of the same halves, fused and rounded once to the
+    /// nearest even f16, f16 denormals kept.
+    ///
+    /// The product of two halves is exact in f32 and so is the error of the
+    /// f32 sum (TwoSum; every value is a multiple of 2^-48, never an f32
+    /// denormal, and below 2^33). That sum rounded to odd (its last bit set
+    /// where it is inexact) and then to the nearest f16 is the fused result
+    /// rounded once (24 bits >= 11 + 2). The last rounding is
+    /// [`Self::f16_nearest`]: the host's own conversion may round toward
+    /// zero. NaNs stay NaNs, but their bits are the host's.
+    fn packed_fmac_f16(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("v_pk_fmac_f16 with SDWA or DPP");
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a packed result outside a VGPR");
+        };
+        // A literal in a VOP2 packed operation: only one whose halves agree,
+        // which reads the same whichever half the hardware replicates.
+        match v.src.first() {
+            Some(Operand::Literal(x)) if x >> 16 != x & 0xFFFF => {
+                return Err("a packed literal with two different halves");
+            }
+            Some(Operand::Const(_)) => return Err("an inline constant in v_pk_fmac_f16"),
+            _ => {}
+        }
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let srcs = [
+            self.operand(inst, v.src.first().ok_or("a missing operand")?)?,
+            self.operand(inst, v.src.get(1).ok_or("a missing operand")?)?,
+            self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?,
+        ];
+        let (k16, low, one, zero) = (
+            self.s.m.i32(16),
+            self.s.m.i32(0xFFFF),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let mut halves = Vec::new();
+        for high in [false, true] {
+            let mut x = Vec::new();
+            for &s in &srcs {
+                let h = if high {
+                    self.s.m.bin(c, Bin::LShr, s, k16)
+                } else {
+                    s
+                };
+                let h = self.s.m.bin(c, Bin::And, h, low);
+                x.push(self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]));
+            }
+            let p = self.s.m.bin(c, Bin::Mul, x[0], x[1]);
+            let sum = self.s.m.bin(c, Bin::Add, p, x[2]);
+            // TwoSum: err = (p - (sum - bb)) + (acc - bb), bb = sum - p.
+            let bb = self.s.m.bin(c, Bin::Sub, sum, p);
+            let pa = self.s.m.bin(c, Bin::Sub, sum, bb);
+            let pe = self.s.m.bin(c, Bin::Sub, p, pa);
+            let ae = self.s.m.bin(c, Bin::Sub, x[2], bb);
+            let err = self.s.m.bin(c, Bin::Add, pe, ae);
+            // Inexact (never for NaN or infinity, whose error is NaN) and even:
+            // one step toward the error, away from zero where it has the sum's sign.
+            let fz = self.s.m.f32(0);
+            let inexact = self.s.m.cmp(c, pred::ONE, err, fz);
+            let bits = self.as_int(sum);
+            let ebits = self.as_int(err);
+            let last = self.s.m.bin(c, Bin::And, bits, one);
+            let even = self.s.m.cmp(c, pred::EQ, last, zero);
+            let step = self.s.m.bin(c, Bin::And, inexact, even);
+            let signs = self.s.m.bin(c, Bin::Xor, bits, ebits);
+            let apart = self.s.m.cmp(c, pred::SLT, signs, zero);
+            let ones = self.s.m.i32(u32::MAX);
+            let delta = self.s.m.select(c, apart, ones, one);
+            let delta = self.s.m.select(c, step, delta, zero);
+            let odd = self.s.m.bin(c, Bin::Add, bits, delta);
+            let odd = self.s.m.cast(c, Cast::Bitcast, odd, f32t);
+            let h = self.f16_nearest(odd);
+            halves.push(self.s.m.bin(c, Bin::And, h, low));
+        }
+        let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+        let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+        self.write(inst, Reg::V(reg), r, guard);
+        Ok(())
+    }
+
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
     /// 16-bit operation does, f16 through f32 as in [`Self::valu16`].
     fn packed16(&mut self, inst: &Inst, op: &str, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
+        if op == "fmac_f16" {
+            return self.packed_fmac_f16(inst, guard);
+        }
         let float = op.ends_with("_f16");
         let n = match op {
             "fma_f16" | "mad_u16" | "mad_i16" => 3,
@@ -8604,7 +8768,19 @@ impl<'a> Lower<'a> {
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
-                self.s.m.bin(c, op, a, b)
+                let r = self.s.m.bin(c, op, a, b);
+                if !saturates(inst) {
+                    return Ok(r);
+                }
+                // clamp: the unsigned result saturates, at 2^32 - 1 past the top
+                // and at 0 below it
+                let (out, at) = if op == Bin::Add {
+                    (self.s.m.cmp(c, pred::IULT, r, a), u32::MAX)
+                } else {
+                    (self.s.m.cmp(c, pred::IULT, a, b), 0)
+                };
+                let at = k(self, at);
+                self.s.m.select(c, out, at, r)
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
@@ -8750,6 +8926,49 @@ impl<'a> Lower<'a> {
                 let a = self.s.m.bin(c, op, a, sh);
                 let b = self.s.m.bin(c, Bin::Shl, b, sh);
                 let b = self.s.m.bin(c, op, b, sh);
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
+            }
+            "v_mad_u32_u16" => {
+                // D = S0[15:0] * S1[15:0] + S2, both halves zero-extended, the sum
+                // wrapping at 32 bits; op_sel bits 0-1 take a register's high half.
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                if v.opsel & 0b1100 != 0 {
+                    return Err("op_sel on a 32-bit operand");
+                }
+                let mut halves = [None; 2];
+                for (j, half) in halves.iter_mut().enumerate() {
+                    if v.abs >> j & 1 != 0 || v.neg >> j & 1 != 0 {
+                        return Err("integer operand modifiers");
+                    }
+                    let high = v.opsel >> j & 1 != 0;
+                    // Only registers have a known high half; an inline float is
+                    // not taken as either width's bits.
+                    match v.src.get(j) {
+                        Some(Operand::Const(240..=248)) => {
+                            return Err("an inline float on a 16-bit integer operand");
+                        }
+                        Some(Operand::Const(_) | Operand::Literal(_)) if high => {
+                            return Err("op_sel on a constant");
+                        }
+                        _ => {}
+                    }
+                    let x = s(self, j)?;
+                    let x = if high {
+                        let k16 = k(self, 16);
+                        self.s.m.bin(c, Bin::LShr, x, k16)
+                    } else {
+                        x
+                    };
+                    let low = k(self, 0xFFFF);
+                    *half = Some(self.s.m.bin(c, Bin::And, x, low));
+                }
+                let [Some(a), Some(b)] = halves else {
+                    unreachable!()
+                };
+                let d = s(self, 2)?;
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
             }
@@ -10344,7 +10563,8 @@ impl<'a> Lower<'a> {
         // min and max, exchange; compare-exchange apart.
         let atomic = match name.strip_prefix("buffer_atomic_") {
             None => None,
-            Some("add") => Some(0),
+            // (sub: an add of the negated value, the same modulo 2^32)
+            Some("add" | "sub") => Some(0),
             Some("and") => Some(1),
             Some("or") => Some(2),
             Some("xor") => Some(3),
@@ -10608,7 +10828,12 @@ impl<'a> Lower<'a> {
             } else {
                 let mut args = vec![h, self.s.m.i32(op)];
                 args.extend(coords);
-                args.push(vals[0]);
+                args.push(if name == "buffer_atomic_sub" {
+                    let zero = self.s.m.i32(0);
+                    self.s.m.bin(self.cur, Bin::Sub, zero, vals[0])
+                } else {
+                    vals[0]
+                });
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
