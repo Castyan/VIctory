@@ -1891,3 +1891,41 @@ fn the_group_info_sgpr_read_whole_is_refused() {
         assert!(err.to_string().contains("thread-group info SGPR read past"), "{err}");
     }
 }
+
+/// One console wave of 64 threads (the paired form): every lane zeroes the dword at byte 4 of
+/// LDS, the even lanes `ds_append` there (0x218 programs `8646605da9720718`, `f7451d949afb803e`)
+/// and add their count below (`v_mbcnt`): each even lane n gets n / 2, the slot the console
+/// gives it, the odd lanes keep 0xffff, and every lane then reads the 32 the wave added.
+#[test]
+fn an_append_counts_the_console_waves_lanes_once() {
+    let mut w = vec![vop1(0x01, 1, k(0)), vop1(0x01, 2, LIT), 0xFFFF]; // v1 = 0, v2 = 0xffff
+    w.extend(ds(0x0D, 0, 1, 1, 4)); // ds_write_b32 v1, v1 offset:4
+    w.extend([
+        0xBF8C_C07F,            // s_waitcnt lgkmcnt(0)
+        vop2(0x1B, 3, k(1), 0), // v_and_b32 v3, 1, v0
+        vopc(0xC2, k(0), 3),    // v_cmp_eq_u32 vcc, 0, v3: the even lanes
+        sop1(0x24, 12, VCC),    // s_and_saveexec_b64 s[12:13], vcc
+    ]);
+    w.extend(ds(0x3E, 2, 0, 0, 4)); // ds_append v2 offset:4
+    w.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+    w.extend(vop3(0x365, 7, EXEC, k(0))); // v_mbcnt_lo_u32_b32 v7, exec_lo, 0
+    w.extend(vop3(0x366, 7, EXEC + 1, v(7))); // v_mbcnt_hi_u32_b32 v7, exec_hi, v7
+    w.extend([
+        vop2(0x25, 2, v(2), 7), // v_add_nc_u32 v2, v2, v7
+        sop1(0x04, EXEC, 12),   // s_mov_b64 exec, s[12:13]
+    ]);
+    w.extend(ds(0x36, 8, 1, 0, 4)); // ds_read_b32 v8, v1 offset:4
+    w.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+    w.extend(stores([2, 8, 2, 8]));
+    let shader = paired(&native_with(&w, true, 64, 256));
+    let want: Vec<u32> = (0..64u32)
+        .flat_map(|n| {
+            let slot = if n % 2 == 0 { n / 2 } else { 0xFFFF };
+            [slot, 32, slot, 32]
+        })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 256) else { return };
+    same_as_console(&got, &want);
+    eprintln!("ran on the hardware device: one append for the console wave, as on the console");
+}

@@ -4779,6 +4779,67 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// `ds_append` in LDS: adds the number of the console wave's lanes in EXEC to the dword at
+    /// its offset, once, and gives every lane the dword's old value (a slot count the wave's
+    /// lanes then number themselves in with `v_mbcnt`). In the paired form both console lanes of
+    /// each thread count; a console wave cut into host waves that would each add theirs is
+    /// refused.
+    // shortcut: M0's base is taken as 0 where the program does not write M0 (the 0x218
+    // programs address the counter by the offset alone, and zero and read it at that byte);
+    // one that sets M0 for it is refused.
+    fn ds_append(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let Fields::Ds { dst: Some(Operand::Vector { reg, .. }), offset0, offset1, .. } = inst.fields else {
+            return Err("an append without a result");
+        };
+        let m0 = inst.read(Reg::S(crate::ir::M0));
+        if !m0.is_some_and(|v| self.x.p.inputs.iter().any(|&(_, x)| x == v)) {
+            return Err("an append at a base in M0");
+        }
+        if !(self.twin.is_some() || self.console_lanes && self.halves.is_none() && !self.local) {
+            return Err("an append of a console wave across host waves");
+        }
+        if self.s.lds_dwords == 0 {
+            return Err("LDS the program does not allocate");
+        }
+        let guards = if self.twin.is_some() {
+            self.both(|l| l.guard(b, i))?.to_vec()
+        } else {
+            vec![self.guard(b, i)?]
+        };
+        let (c, i32t) = (self.cur, self.s.t.i32);
+        self.s.flags |= flags::WAVE_OPS;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let mut n = self.s.m.i32(0);
+        for &g in &guards {
+            let g = g.unwrap_or_else(|| self.s.m.bool(true));
+            let r = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
+            for k in 0..2 {
+                let word = self.s.m.extract(c, r, k);
+                let bits = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[word]);
+                n = self.s.m.bin(c, Bin::Add, n, bits);
+            }
+        }
+        let i1t = self.s.t.i1;
+        let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
+        let zero = self.s.m.i32(0);
+        let add = self.s.m.select(c, first, n, zero);
+        let at = self.s.m.i32((u32::from(offset0) | u32::from(offset1) << 8) / 4);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(c, lds, at);
+        let old = self.s.m.atomic(c, Rmw::Add, ptr, add);
+        let r = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        // (each console lane under its own guard: a lane outside EXEC keeps its value)
+        if self.twin.is_some() {
+            self.both(|l| {
+                l.write(inst, Reg::V(reg), r, guards[usize::from(l.upper)]);
+                Ok(())
+            })?;
+        } else {
+            self.write(inst, Reg::V(reg), r, guards[0]);
+        }
+        Ok(())
+    }
+
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
@@ -4796,6 +4857,9 @@ impl<'a> Lower<'a> {
             return Err("GDS");
         }
         let name = inst.name();
+        if name == "ds_append" {
+            return self.ds_append(inst, b, i);
+        }
         let guard = self.guard(b, i)?;
         let c = self.cur;
         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
@@ -5318,7 +5382,9 @@ impl<'a> Lower<'a> {
         let name = inst.name();
         let once = matches!(inst.fields, Fields::Sopp { .. })
             || matches!(inst.fields, Fields::Smem { .. })
-                && (name.contains("store") || name.contains("atomic"));
+                && (name.contains("store") || name.contains("atomic"))
+            // (counts both lanes of each thread itself)
+            || name == "ds_append";
         if once {
             self.inst(b, i)?;
             self.mirror(inst);
