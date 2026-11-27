@@ -1929,3 +1929,28 @@ fn an_append_counts_the_console_waves_lanes_once() {
     same_as_console(&got, &want);
     eprintln!("ran on the hardware device: one append for the console wave, as on the console");
 }
+
+/// A whole-wave section (the wave OR of `super::wave::WAVE_OR_V7_TO_S7`, lane t giving bit
+/// t >> 1) with scalar work inside it: `s_lshr_b32 s20, s7, 1` of the OR's lane read, read past
+/// the section (0x218 program `2de0c233d150046c` shifts its reduction's lane read so). The
+/// scalar is lowered as anywhere else: every thread of the console wave gets the OR >> 1.
+#[test]
+fn scalar_work_inside_a_whole_wave_section_takes_the_sections_value() {
+    let mut w = vec![
+        vop2(0x16, 3, k(1), 0), // v_lshrrev_b32 v3, 1, v0
+        vop1(0x01, 6, k(1)),    // v_mov_b32 v6, 1
+    ];
+    w.push(vop2(0x1A, 7, v(3), 6)); // v_lshlrev_b32 v7, v3, v6: 1 << (t >> 1)
+    let section = super::wave::WAVE_OR_V7_TO_S7;
+    w.extend_from_slice(&section[..section.len() - 1]);
+    w.push(sop2(0x20, 20, 7, k(1))); // s_lshr_b32 s20, s7, 1
+    w.push(section[section.len() - 1]); // s_mov_b64 exec, s[4:5]
+    w.push(vop1(0x01, 9, 20)); // v_mov_b32 v9, s20
+    w.extend(stores([9, 9, 9, 9]));
+    let shader = paired(&native_with(&w, true, 64, 256));
+    let want = vec![u32::MAX >> 1; 256];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0; 4], 256) else { return };
+    same_as_console(&got, &want);
+    eprintln!("ran on the hardware device: the section's scalar work as on the console");
+}

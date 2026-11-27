@@ -1187,6 +1187,15 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     partners
 }
 
+/// A scalar ALU instruction that neither reads nor writes EXEC: inside a whole-wave section
+/// it does not depend on the lanes, so it is lowered as anywhere else (0x218 program
+/// `2de0c233d150046c` shifts a lane read of a reduction there, `s_lshr_b32 s39, s37, 5`, and
+/// reads the result past the section), and the section's values it reads are given theirs.
+fn plain_scalar(inst: &Inst) -> bool {
+    matches!(inst.fields, Fields::Sop { .. })
+        && ![Reg::S(EXEC), Reg::S(EXEC + 1)].iter().any(|&r| inst.read(r).is_some() || inst.write(r).is_some())
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1821,7 +1830,7 @@ impl<'a> Lower<'a> {
             for (i, inst) in block.insts.iter().enumerate() {
                 for &(_, r) in &inst.reads {
                     if let Some(&(sb, start, end)) = inside.get(&r)
-                        && !(sb == b && i > start && i < end)
+                        && !(sb == b && i > start && i < end && !plain_scalar(inst))
                     {
                         self.section_out.insert(r);
                     }
@@ -2350,7 +2359,14 @@ impl<'a> Lower<'a> {
                 }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
-                        if self.twin.is_some() {
+                        // (scalar work beside the lanes: lowered as anywhere else)
+                        if plain_scalar(&p.blocks[b].insts[j]) {
+                            if self.twin.is_some() {
+                                self.paired_inst(b, j)?;
+                            } else {
+                                self.inst(b, j)?;
+                            }
+                        } else if self.twin.is_some() {
                             self.paired_section_inst(b, j, i);
                         } else {
                             self.section_inst(b, j, i);
