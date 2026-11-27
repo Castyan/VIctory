@@ -242,3 +242,77 @@ fn a_sampler_each_arm_of_a_uniform_branch_sets_samples_as_that_arm_says() {
         }
     }
 }
+
+#[test]
+fn an_immediate_sampler_made_with_a_64_bit_bitmask_samples_as_its_words_say() {
+    // The 0x218 programs' sampler: `s_bfm_b64 s[44:45], 2, 54` (dword 1 = 3 << 22, levels up to
+    // 12) and `s_mov_b64 s[46:47], 0x18500000` (linear filters and mips), wrapping (dword 0 =
+    // 0). At u = 1.0 of a 2 x 1 texture the sample is halfway between texel 1 (red 2.0) and,
+    // wrapped, texel 0 (red 1.0): 1.5. Point filtering would give 1.0, clamping 2.0.
+    let shader = translate(&native(&[
+        0x9294_B682, // s_bfm_b64 s[20:21], 2, 54
+        0xBE96_04FF,
+        0x1850_0000, // s_mov_b64 s[22:23], 0x18500000
+        0x7E02_02FF,
+        0x3F80_0000, // v_mov_b32 v1, 1.0
+        0x7E04_02FF,
+        0x3F00_0000, // v_mov_b32 v2, 0.5
+        0xF09C_0F08,
+        0x00A2_0301, // image_sample_lz v[3:6], v[1:2], s[8:15], s[20:23] dmask:0xf 2D
+        0xE070_0000,
+        0x8004_0300, // buffer_store_dword v3, off, s[16:19], 0
+    ]));
+    assert_eq!(shader.static_samplers.len(), 1);
+    let s = shader.static_samplers[0];
+    assert_eq!((s.filter, s.address, s.max_lod), (0x15, [1, 1, 1], 12.0));
+    let texels = [[1.0f32, 0.0, 0.0, 1.0], [2.0, 0.0, 0.0, 1.0]];
+    for (label, words) in run(&shader, 0, View::Texture(2, 1, &texels)) {
+        assert_eq!(f32::from_bits(words[0]), 1.5, "{label}");
+    }
+}
+
+#[test]
+fn a_structured_buffer_made_raw_reads_typed_at_its_byte() {
+    // The 0x218 programs' structured buffer made raw (`slot218-m093`): stride cleared, the record
+    // count times the stride, `OOB_SELECT` raw, then read by `tbuffer_load_format_xy` at a byte
+    // offset in the format the instruction names. Elements of 8 bytes; byte 12 is the second
+    // dword of element 1, (0, 0x7fff) as 16_16_SNORM: (0.0, 1.0). Every other dword is
+    // (0x7fff, 0): an index scaled by the stride or a wrong dword would read (1.0, 0.0).
+    let shader = translate(&native_of(
+        &[
+            0x9394_FF09,
+            0x000E_0010, // s_bfe_u32 s20, s9, 0xe0010 (the stride)
+            0x8494_8114, // s_max_u32 s20, s20, 1
+            0x870B_FF0B,
+            0xCFFF_FFFF, // s_and_b32 s11, s11, 0xcfffffff
+            0x930A_140A, // s_mul_i32 s10, s10, s20
+            0x880B_FF0B,
+            0x3000_0000, // s_or_b32 s11, s11, 0x30000000
+            0x8709_FF09,
+            0xC000_FFFF, // s_and_b32 s9, s9, 0xc000ffff
+            0x7E06_028C, // v_mov_b32 v3, 12
+            0xE8C1_1000,
+            0x8002_0103, // tbuffer_load_format_xy v[1:2], v3, s[8:11], 0 offen format:[BUF_FMT_16_16_SNORM]
+            0xE070_0000,
+            0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+            0xE070_0004,
+            0x8004_0200, // buffer_store_dword v2, off, s[16:19], 0 offset:4
+        ],
+        4,
+        8,
+    ));
+    let mut data = [0x0000_7FFFu32; 2 * 3];
+    data[3] = 0x7FFF_0000;
+    // The runtime's buffer views are raw.
+    let buffer = View::Buffer {
+        data: &data,
+        stride: super::host::Stride::Raw,
+    };
+    for (label, words) in run(&shader, 0, buffer) {
+        assert_eq!(
+            [f32::from_bits(words[0]), f32::from_bits(words[1])],
+            [0.0, 1.0],
+            "{label}"
+        );
+    }
+}

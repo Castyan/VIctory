@@ -2410,7 +2410,9 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            // (a value lowered into a block it does not dominate: refused,
+            // not written)
+            dxil: self.s.try_finish().map_err(|w| unsupported(0, w))?,
             user_data,
             samplers: self.samplers,
         })

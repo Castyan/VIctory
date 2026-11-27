@@ -520,7 +520,7 @@ impl<'a> Tracer<'a> {
                         let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => Some(Term::Value(v)),
+                            None => self.xor_swapped(inst, k, &o).or(Some(Term::Value(v))),
                         };
                         if new.is_some() && new != o[v.0 as usize] {
                             o[v.0 as usize] = new;
@@ -540,6 +540,27 @@ impl<'a> Tracer<'a> {
         Err(ShaderError::Unsupported {
             offset: 0,
             what: "copies that do not settle",
+        })
+    }
+
+    /// Dword `k` of `inst` as `(p ^ q) ^ q`, which is `p`: the register swap compilers write as
+    /// three XORs (`s_xor a, a, b; s_xor b, a, b; s_xor a, a, b`, the 0x218 programs'
+    /// descriptors). `o` holds the origins found so far.
+    fn xor_swapped(&self, inst: &Inst, k: usize, o: &[Option<Term>]) -> Option<Term> {
+        let [a, b] = xor_operands(inst, k)?;
+        let (ta, tb) = (o[a.0 as usize]?, o[b.0 as usize]?);
+        [(ta, tb), (tb, ta)].into_iter().find_map(|(x, y)| {
+            let Term::Value(x) = x else { return None };
+            let def = self.def(x)?;
+            let [p, q] = xor_operands(def, def.writes.iter().position(|w| w.1 == x)?)?;
+            let (tp, tq) = (o[p.0 as usize]?, o[q.0 as usize]?);
+            if tq == y {
+                Some(tp)
+            } else if tp == y {
+                Some(tq)
+            } else {
+                None
+            }
         })
     }
 
@@ -1148,12 +1169,16 @@ impl<'a> Tracer<'a> {
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
         self.raw.set(false);
         let source = self.classify(&words, &mut Vec::new(), &mut known)?;
-        // A structured buffer made raw has no stride and no format: an index
-        // would add nothing and a format read would read a raw dword, where
-        // the load's descriptor would not.
+        // A structured buffer made raw has no stride and its format is the
+        // load's: an index would add nothing, where the load's descriptor
+        // would scale it, and a format read would take the format the load's
+        // descriptor says. A typed read (`tbuffer_load_format_*`) names its
+        // own format: by byte, it reads what the load's raw view holds there.
         if self.raw.get() {
             let by_byte = match inst.fields {
-                Fields::Buffer { idxen, .. } => !idxen && !inst.name().contains("format"),
+                Fields::Buffer { idxen, format, .. } => {
+                    !idxen && (format.is_some() || !inst.name().contains("format"))
+                }
                 Fields::Smem { .. } => true,
                 _ => false,
             };
@@ -1536,10 +1561,20 @@ impl<'a> Tracer<'a> {
         self.read_first_lane.set(true);
         let address = self.smem_address(inst, base, *offset, soffset);
         self.read_first_lane.set(false);
-        match self.origin(address.ok()?.dynamic?) {
-            Term::Value(v) if self.first_lane_source(v).is_some() => Some(v),
-            _ => None,
+        let Term::Value(mut v) = self.origin(address.ok()?.dynamic?) else {
+            return None;
+        };
+        // A table of records wider than a dword: the read shifted by a constant
+        // (`s_lshl_b32 s11, s11, 5`).
+        if let Some(shl) = self.def(v)
+            && shl.name() == "s_lshl_b32"
+            && let Fields::Sop { src, .. } = &shl.fields
+            && let [Operand::Scalar { code, .. }, Operand::Const(_) | Operand::Literal(_)] = src.as_slice()
+            && let Some(Term::Value(x)) = shl.read(Reg::S(*code)).map(|x| self.origin(x))
+        {
+            v = x;
         }
+        self.first_lane_source(v).is_some().then_some(v)
     }
 
     /// Whether the descriptor operand `op` of `inst` is one the code keeps
@@ -1980,8 +2015,15 @@ impl<'a> Tracer<'a> {
         let block = &self.p.blocks[b];
         let lanes = self.lanes.ok_or(LOOP)?;
         let exit = block.insts.last().ok_or(LOOP)?;
+        // `s_cbranch_scc1` on the SCC an `_wrexec` just left ("the EXEC it writes is not
+        // empty") is `s_cbranch_execnz` on that EXEC.
+        let wrexec = block.insts.iter().rev().nth(1).filter(|w| {
+            exit.name() == "s_cbranch_scc1"
+                && w.name().contains("_wrexec_")
+                && w.write(Reg::Scc).is_some_and(|s| exit.read(Reg::Scc) == Some(s))
+        });
         if !matches!(block.exit, Exit::Branch { taken, not_taken } if taken == b && not_taken != b)
-            || exit.name() != "s_cbranch_execnz"
+            || (exit.name() != "s_cbranch_execnz" && wrexec.is_none())
         {
             return Err(LOOP);
         }
@@ -1999,14 +2041,22 @@ impl<'a> Tracer<'a> {
         {
             return Err(SPLIT);
         }
-        let selected = exec(&block.insts[access]).ok_or(SELECT)?;
-        if accesses
-            .iter()
-            .any(|&i| exec(&block.insts[i]) != Some(selected))
+        // A scalar access reads no EXEC: the lanes it serves are EXEC where it stands.
+        let exec_at = |i: usize| {
+            let pick = |x: &Inst, r| x.write(r).or_else(|| x.read(r));
+            let x = block.insts[..=i].iter().rev().find(|x| pick(x, Reg::S(EXEC)).is_some())?;
+            mask(pick(x, Reg::S(EXEC)), pick(x, Reg::S(EXEC + 1)))
+        };
+        let selected = exec_at(access).ok_or(SELECT)?;
+        if accesses.iter().any(|&i| exec_at(i) != Some(selected))
         {
             return Err(SELECT);
         }
-        let retry = exec(exit).ok_or(RETRY)?;
+        let retry = match wrexec {
+            Some(w) => mask(w.write(Reg::S(EXEC)), w.write(Reg::S(EXEC + 1))),
+            None => exec(exit),
+        }
+        .ok_or(RETRY)?;
         let first = self.defs[reads[0].0 as usize].ok_or(LOOP)?;
         let remaining = exec(self.inst(first)).ok_or(SELECT)?;
         if reads.iter().any(|v| {
@@ -2407,6 +2457,21 @@ fn constant_operand(op: Operand) -> Option<u32> {
     }
 }
 
+/// The two values dword `k` of an `s_xor_b32` or `s_xor_b64` result is the XOR of.
+fn xor_operands(inst: &Inst, k: usize) -> Option<[Value; 2]> {
+    if !(inst.name() == "s_xor_b32" && k == 0 || inst.name() == "s_xor_b64" && k < 2) {
+        return None;
+    }
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    let read = |op: &Operand| match *op {
+        Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code + k as u8)),
+        _ => None,
+    };
+    Some([read(src.first()?)?, read(src.get(1)?)?])
+}
+
 /// What dword `k` of a move's result copies.
 fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     let Fields::Sop { src, imm, .. } = &inst.fields else {
@@ -2420,6 +2485,19 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         let width = constant_operand(*width)? & 31;
         let shift = constant_operand(*shift)? & 31;
         return Some(Moved::Const(((1u32 << width) - 1) << shift));
+    }
+    // Bits `shift` up of a field of `width` ones, both from bits 5:0 (the
+    // 0x218 programs' samplers: `s_bfm_b64 s[44:45], 2, 54`).
+    if inst.name() == "s_bfm_b64" {
+        let [width, shift] = src.as_slice() else { return None };
+        let width = constant_operand(*width)? & 63;
+        let shift = constant_operand(*shift)? & 63;
+        let field = ((1u64 << width) - 1) << shift;
+        return match k {
+            0 => Some(Moved::Const(field as u32)),
+            1 => Some(Moved::Const((field >> 32) as u32)),
+            _ => None,
+        };
     }
     let src = src.first()?;
     match (inst.name(), *src) {
@@ -2501,6 +2579,37 @@ pub(crate) mod tests {
         }
     }
 
+    /// A descriptor dword swapped away and back by three XORs each way (the 0x218 programs'
+    /// register shuffles, `m103` at 0x1bac) is still the loaded dword.
+    #[test]
+    fn a_descriptor_swapped_by_xors_is_still_the_loaded_one() {
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0204,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[8:9], null
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0xBE8C_0380, // s_mov_b32 s12, 0
+                0x8900_0C00, // s_xor_b32 s0, s0, s12
+                0x890C_0C00, // s_xor_b32 s12, s0, s12
+                0x8900_0C00, // s_xor_b32 s0, s0, s12   (s0 = 0, s12 = the dword)
+                0x8900_0C00, // s_xor_b32 s0, s0, s12
+                0x890C_0C00, // s_xor_b32 s12, s0, s12
+                0x8900_0C00, // s_xor_b32 s0, s0, s12   (back)
+                0xF080_0F08,
+                0x0040_0002, // image_sample v[0:3], v[2:3], s[0:7], s[8:11]
+                S_ENDPGM,
+            ],
+            &[param(Table, 8, 1), param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r.scalar, [((0, 3), at(0, 0)), ((0, 4), at(1, 0))]);
+        assert!(r.descriptors.iter().all(|d| matches!(d.source, Source::Loaded { .. })), "{:?}", r.descriptors);
+    }
+
     #[test]
     fn table_descriptors_are_loaded_from_their_range() {
         let r = track_words(
@@ -2559,6 +2668,48 @@ pub(crate) mod tests {
         );
         let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
         assert_eq!(sampler.source, Source::Constant(vec![0, 0xf8, 0x8000_0001, 0]));
+    }
+
+    /// The 0x218 programs make an immediate sampler with `s_bfm_b64
+    /// s[44:45], 2, 54` (dword 1 = 3 << 22: MAX_LOD 12) and `s_mov_b64
+    /// s[46:47], 0x18500000`; untracked, its first two dwords looked like
+    /// an address and the program was refused as "an address not from a
+    /// root parameter".
+    #[test]
+    fn a_64_bit_bitmask_can_supply_static_sampler_words() {
+        let r = track_words(
+            &[
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001, 0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0x9288_B682, // s_bfm_b64 s[8:9], 2, 54
+                0xBE8A_04FF, 0x1850_0000, // s_mov_b64 s[10:11], 0x18500000
+                0xF080_0F08, 0x0040_0002, // image_sample using s[8:11] as its sampler
+                S_ENDPGM,
+            ],
+            &[param(Table, 2, 1)],
+            HwStage::Cs,
+        );
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
+        assert_eq!(sampler.source, Source::Constant(vec![0, 0x00C0_0000, 0x1850_0000, 0]));
+        // A field across both dwords: s_bfm_b64 s[8:9], 40, 20.
+        let r = track_words(
+            &[
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001, 0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0x9288_94A8, // s_bfm_b64 s[8:9], 40, 20
+                0xBE8A_0480, // s_mov_b64 s[10:11], 0
+                0xF080_0F08, 0x0040_0002, // image_sample using s[8:11] as its sampler
+                S_ENDPGM,
+            ],
+            &[param(Table, 2, 1)],
+            HwStage::Cs,
+        );
+        let field = ((1u64 << 40) - 1) << 20;
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
+        assert_eq!(
+            sampler.source,
+            Source::Constant(vec![field as u32, (field >> 32) as u32, 0, 0])
+        );
     }
 
     #[test]
@@ -2953,19 +3104,24 @@ pub(crate) mod tests {
 
     const MUL_BY_STRIDE: u32 = 0x9306_0806; // s_mul_i32 s6, s6, s8
     const BY_BYTE: [u32; 2] = [0xE030_1034, 0x8001_0100]; // buffer_load_dword v1, v0, s[4:7], 0 offen offset:52
+    /// `tbuffer_load_format_xy v[1:2], v0, s[4:7], 0 offen format:[BUF_FMT_16_16_SNORM]`, as
+    /// the title's 0x218 programs read the buffer they make raw (`slot218-m093` at 0x1e94).
+    const TYPED_BY_BYTE: [u32; 2] = [0xE8C1_1000, 0x8001_0100];
 
     #[test]
     fn a_structured_buffer_made_raw_is_its_load() {
-        let code = made_raw(MUL_BY_STRIDE, BY_BYTE);
-        let r = track_words(&code, &[param(Table, 9, 1)], HwStage::Ps);
-        assert_eq!(r.scalar, [((0, 2), at(0, 0))]);
-        assert_eq!(
-            r.descriptors[0].source,
-            Source::Loaded {
-                load: (0, 2),
-                first: 0
-            }
-        );
+        for last in [BY_BYTE, TYPED_BY_BYTE] {
+            let code = made_raw(MUL_BY_STRIDE, last);
+            let r = track_words(&code, &[param(Table, 9, 1)], HwStage::Ps);
+            assert_eq!(r.scalar, [((0, 2), at(0, 0))]);
+            assert_eq!(
+                r.descriptors[0].source,
+                Source::Loaded {
+                    load: (0, 2),
+                    first: 0
+                }
+            );
+        }
     }
 
     #[test]
@@ -2979,6 +3135,15 @@ pub(crate) mod tests {
         let by_index = [0xE030_2000, 0x8001_0100]; // buffer_load_dword v1, v0, s[4:7], 0 idxen
         assert_eq!(
             fails(made_raw(MUL_BY_STRIDE, by_index)),
+            ShaderError::Unsupported {
+                offset: 0x38,
+                what: "a structured buffer made raw, read by index or format"
+            }
+        );
+        // A format read takes the descriptor's format, which is the load's.
+        let by_format = [0xE004_1000, 0x8001_0100]; // buffer_load_format_xy v[1:2], v0, s[4:7], 0 offen
+        assert_eq!(
+            fails(made_raw(MUL_BY_STRIDE, by_format)),
             ShaderError::Unsupported {
                 offset: 0x38,
                 what: "a structured buffer made raw, read by index or format"

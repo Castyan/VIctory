@@ -523,8 +523,15 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
-    /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    /// The finished container. Panics on code [`Self::try_finish`] refuses.
+    pub fn finish(self) -> Vec<u8> {
+        self.try_finish().expect("a value used where it is not defined")
+    }
+
+    /// The finished container, or why the code cannot be written: a value
+    /// read in a block it does not dominate
+    /// ([`super::bitcode::Module::defined_before_use`]).
+    pub fn try_finish(mut self) -> Result<Vec<u8>, &'static str> {
         if self.pixel {
             // Reading a per-vertex value with attributeAtVertex needs a
             // constant input, even when the source declaration was smooth.
@@ -869,6 +876,9 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        if !self.m.defined_before_use() {
+            return Err("a value used where it is not defined");
+        }
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
@@ -942,7 +952,7 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        Ok(container::build(&parts))
     }
 
     /// The user-data buffer's annotation carries its size, known only now.
