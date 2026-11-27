@@ -730,6 +730,13 @@ pub(crate) extern "system" fn create_native_compute(
     if made.is_power_of_two() {
         tracing::info!(made, hash = %shader.hash, "native compute descriptions decoded");
     }
+    // A program that does not translate is refused here, as every 0x218 program was before:
+    // handed a pipeline whose dispatches are then dropped, the title's GPU-driven passes go on
+    // without their results instead of taking the way it has for a missing pipeline.
+    #[cfg(windows)]
+    if shader.translated().is_none() {
+        return crate::object::E_NOTIMPL;
+    }
     hand_out(
         vec![shader],
         #[cfg(windows)]
@@ -1068,6 +1075,14 @@ mod tests {
         let programs = victory_shader::native_programs(c.part(victory_shader::FourCC::DXIL).unwrap().data).unwrap();
         assert_eq!(programs[0].code, code[0].to_le_bytes());
         assert_eq!(slot::<extern "system" fn(This) -> u32>(out, 0x10)(out), 0);
+
+        // A program that reads but does not translate (an indirect jump) is refused as one
+        // that does not read: no pipeline whose dispatches would be dropped.
+        let jump = [0xBE80_2000u32, 0xBF81_0000]; // s_setpc_b64 s[0:1]; s_endpgm
+        desc[5] = jump.as_ptr() as usize;
+        desc[6] = size_of_val(&jump);
+        assert_eq!(create(device, desc.as_ptr().cast(), &PIPELINE_IIDS[0], &mut out), crate::object::E_NOTIMPL);
+        assert!(out.is_null());
 
         desc[6] = 0;
         assert_eq!(create(device, desc.as_ptr().cast(), &PIPELINE_IIDS[0], &mut out), crate::object::E_NOTIMPL);
