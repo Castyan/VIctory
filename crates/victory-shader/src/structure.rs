@@ -844,6 +844,8 @@ impl<'a> Lanes<'a> {
                 split.insert(lo);
             }
         }
+        // By its pair a split mask is still one: an instruction that reads both dwords asks so.
+        let paired_masks = if self.p.wave64 { self.masks.clone() } else { Map::default() };
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
@@ -854,7 +856,7 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks,
             active: self.active,
             wide: self.wide,
             wave_any: self.wave_any,
@@ -1806,6 +1808,32 @@ mod tests {
                 "{reader:#x}: vcc_hi was zeroed after the compare"
             );
         }
+    }
+
+    /// The other side of the test above (0x218 program `6290a7dbe007d846` at 0x198-0x230): the
+    /// compare's pair read before its high dword is rewritten alone is still the compare,
+    /// by its pair, though its low dword alone also names the pair read after.
+    #[test]
+    fn a_compare_read_before_its_high_dword_is_rewritten_is_the_compare_by_its_pair() {
+        let p = build(
+            &[
+                0xD4C4_0000,
+                0x0001_0B00, // v_cmp_gt_u32 s[0:1], v0, 5
+                0xD501_0001,
+                0x0001_0280, // v_cndmask_b32 v1, 0, 1, s[0:1]
+                0xBE81_0387, // s_mov_b32 s1, 7
+                0x87FE_7E00, // s_and_b64 exec, s[0:1], exec
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let select = &p.blocks[0].insts[1];
+        let (lo, hi) = (select.read(Reg::S(0)).unwrap(), select.read(Reg::S(1)).unwrap());
+        assert_eq!(p.blocks[0].insts[0].write(Reg::S(1)), Some(hi));
+        assert!(!s.masks.contains_key(&lo), "the low dword alone names two pairs");
+        let m = s.mask_bits(lo, Some(hi)).expect("the compare, by its pair");
+        assert_eq!(s.bools.node(m), Some((Atom::Lane(lo), Bool::FALSE, Bool::TRUE)));
     }
 
     #[test]

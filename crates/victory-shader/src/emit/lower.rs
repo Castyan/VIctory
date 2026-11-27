@@ -2782,6 +2782,19 @@ impl<'a> Lower<'a> {
         self.load_any_input(id, index + 1)
     }
 
+    /// The lane mask scalar operand `op` of `inst` holds: by its low dword, or in wave64 by
+    /// the pair it reads, where its low dword alone is also read with another high one.
+    fn operand_mask(&self, inst: &Inst, op: Option<&Operand>) -> Option<Bool> {
+        let Some(&Operand::Scalar { code, .. }) = op else {
+            return None;
+        };
+        let lo = inst.read(Reg::S(code))?;
+        self.x.st.masks.get(&lo).copied().or_else(|| {
+            let hi = inst.read(Reg::S(code + 1)).filter(|_| self.x.native.wave64)?;
+            self.x.st.mask_bits(lo, Some(hi))
+        })
+    }
+
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
         match self.get(v)? {
             Val::I32(x) => Ok(x),
@@ -7778,7 +7791,7 @@ impl<'a> Lower<'a> {
                     _ => None,
                 };
                 const UNTRACKED: Why = "a select on an untracked mask";
-                let cond = match mask.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                let cond = match self.operand_mask(inst, v.src.get(2)) {
                     Some(m) => self.boolean(m, c)?,
                     // A mask the code holds as a number (a constant bit
                     // pattern: every other lane, every other pair...):
@@ -7825,12 +7838,8 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                        _ => None,
-                    };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
+                    let m = self
+                        .operand_mask(inst, v.src.get(2))
                         .ok_or("a carry-in from an untracked mask")?;
                     Some(self.boolean(m, c)?)
                 } else {
