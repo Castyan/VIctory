@@ -695,6 +695,12 @@ pub(crate) extern "system" fn create_native_compute(
         // SAFETY: the title's out pointer.
         unsafe { *out = std::ptr::null() };
     }
+    // VICTORY_NATIVE_COMPUTE=0: every 0x218 call fails as on main, to tell in one run whether
+    // a picture lost in game comes from these pipelines
+    static OFF: OnceLock<bool> = OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("VICTORY_NATIVE_COMPUTE").is_some_and(|v| v == "0")) {
+        return crate::object::E_NOTIMPL;
+    }
     let program = (|| -> Result<Vec<u8>, String> {
         let registers = title_bytes(desc, 1).map_err(|e| format!("registers: {e}"))?;
         let code = title_bytes(desc, 5).map_err(|e| format!("code: {e}"))?;
